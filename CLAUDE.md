@@ -18,6 +18,11 @@
 ## 資料夾結構
 
 ```text
+.claude/
+  settings.json                                # 權限與 sandbox 設定（deny 讀取 .env 系列、安裝套件要確認等）
+  agents/                                       # 自訂 subagent：QA.md、RESEARCH.md、CODE_REVIEW.md
+  skills/                                       # 自訂 skill，格式為 <name>/SKILL.md + scripts/
+  rules/                                        # 路徑限定規則（paths frontmatter），例如 python.md、sql.md
 docs/
 datasets/
   energyops_test_questions.json              # 29 題固定評測問題，複製自 MVP_V1 spike/test_questions.json
@@ -31,7 +36,7 @@ active/                                        # 工作中的暫存區，不進�
   temp/                                        # 純暫存，隨時可丟
 ```
 
-`active/` 底下四個子資料夾各自只保留一個 `.gitkeep` 佔位，實際內容透過 `.gitignore` 排除在版控之外，可以放心在裡面產生、堆放任何還沒定案的東西。**定案的東西要手動搬到 `results/`（評測結果）或 `docs/`（正式文件）**，`active/` 本身永遠不會出現在 commit 歷史裡。
+`active/` 底下四個子資料夾各自只保留一個 `.gitkeep` 佔位，實際內容透過 `.gitignore` 排除在版控之外，可以放心在裡面產生、堆放任何還沒定案的東西。**定案的東西要手動搬到 `results/`（評測結果）、`docs/`（正式文件）、或 `datasets/`（定案的新資料集）**，`active/` 本身永遠不會出現在 commit 歷史裡。
 
 ## 這個 repo 的工作慣例
 
