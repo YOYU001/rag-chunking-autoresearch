@@ -105,6 +105,8 @@ def _enrich(rows: list[dict]) -> list[dict]:
                 "_redundancy_ratio": _safe_float(r.get("redundancy_ratio")),
                 "_seconds": _safe_float(r.get("seconds")),
                 "_same_session_baseline_cost_time": _safe_float(r.get("same_session_baseline_cost_time")),
+                "_device_baseline_cost_time": _safe_float(r.get("device_baseline_cost_time")),
+                "_device_anomaly_note": r.get("device_anomaly_note") or "",
                 "_ts": _parse_ts(r.get("timestamp")),
             }
         )
@@ -159,8 +161,28 @@ def _first_value(rows: list[dict], key: str) -> Optional[float]:
     return next((r[key] for r in rows if r.get(key) is not None), None)
 
 
-def _speed_baseline(all_kept: list[dict]) -> Optional[float]:
-    return _first_value(all_kept, "_cost_time")
+def _rebaseline_lookup(all_rows: list[dict]) -> dict[str, dict]:
+    """把 `status == "rebaseline"` 的紀錄整理成 `commit -> {cost_time,
+    device_baseline_cost_time}` 的查詢表。這些是 2026-08-14「設備基準」機制上線
+    時，對每一筆歷史 `keep` 紀錄在同一天重新測一次得到的公平對照數字，不是新的
+    實驗嘗試，不計入 keep/discard/crash 統計，也不會出現在趨勢圖的線上——只當
+    查詢表用，給沒有自己 `device_baseline_cost_time` 的舊 `keep` 紀錄拿去對照。"""
+    lookup: dict[str, dict] = {}
+    for r in all_rows:
+        if r.get("status") != "rebaseline":
+            continue
+        commit = r.get("commit")
+        cost_time = r.get("_cost_time")
+        device_baseline = r.get("_device_baseline_cost_time")
+        if commit and cost_time is not None and device_baseline is not None:
+            lookup[commit] = {"cost_time": cost_time, "device_baseline_cost_time": device_baseline}
+    return lookup
+
+
+def _reference_device_baseline(all_rows: list[dict]) -> Optional[float]:
+    """史上第一筆有填 `device_baseline_cost_time` 的紀錄，當作往後所有「設備基準
+    正規化」計算的固定參考值。務必傳未篩選過的 rows 進來，理由同 `_first_value`。"""
+    return _first_value(all_rows, "_device_baseline_cost_time")
 
 
 def _same_session_pct(r: dict) -> Optional[float]:
@@ -190,15 +212,69 @@ def _same_session_note(r: dict) -> str:
     return f"\n同時段重測基準：{base:.4f} → 本次：{cur:.4f}（{pct:+.1f}%，已排除機器負載雜訊）"
 
 
-def _speed_improvement_series(kept: list[dict], baseline: Optional[float]) -> list[Optional[float]]:
-    out = []
+def _speed_improvement_series(
+    kept: list[dict],
+    reference_device_baseline: Optional[float],
+    rebaseline_lookup: dict[str, dict],
+) -> list[Optional[float]]:
+    """跟原始 baseline 直接比原始 `cost_time` 的舊算法，會被機器負載跨日波動污染
+    ——同一份程式碼，機器忙的時候測起來就是比較慢，看起來像退步，即使程式碼其實
+    一直在進步（2026-08-14 使用者發現速度提升度曾經顯示 -107% 這種不合理的大
+    負數，根源就在這裡）。曾經試過把每輪的同時段改善倍率逐輪串接相乘，但串接的
+    起點本身（最後一筆還沒有同時段資料的舊 keep）就已經是被污染的舊算法算出來的
+    數字，污染會被一路帶下去，串接後只從 -107% 變成 -83%，問題沒有真正解決
+    （已本機測試驗證），所以放棄這個做法。
+
+    改成「設備基準正規化」：每個 session 開始時都會重測一次最原始 baseline 的
+    程式碼，量出這次的 `device_baseline_cost_time`（見 program.md「開始每次執行
+    前：設備基準測量」）。用 `cost_time × 參考設備基準 ÷ 這次的設備基準`，把每一筆
+    的原始秒數換算成「如果在參考設備狀態下會測到幾秒」，天生互相可比，不需要
+    分段、不需要串接：
+
+        normalized_cost_time = cost_time * reference_device_baseline / device_baseline_cost_time
+        提升度 % = (reference_device_baseline - normalized_cost_time) / reference_device_baseline * 100
+
+    這個機制上線之前的舊 keep 紀錄，自己沒有 `device_baseline_cost_time`——改用
+    `rebaseline_lookup`（今天一次性回測每個歷史 commit 得到的查詢表）拿它們今天
+    重新測出來的數字代入，一樣套用同一條公式，沒有特殊分支。"""
+    out: list[Optional[float]] = []
     for r in kept:
-        v = r["_cost_time"]
-        if v is None or baseline is None or baseline == 0:
+        cost_time = r.get("_cost_time")
+        device_baseline = r.get("_device_baseline_cost_time")
+        if (cost_time is None or device_baseline is None) and r.get("commit") in rebaseline_lookup:
+            backfilled = rebaseline_lookup[r["commit"]]
+            cost_time = backfilled["cost_time"]
+            device_baseline = backfilled["device_baseline_cost_time"]
+        if (
+            cost_time is None
+            or device_baseline is None
+            or device_baseline == 0
+            or reference_device_baseline is None
+            or reference_device_baseline == 0
+        ):
             out.append(None)
-        else:
-            out.append((baseline - v) / baseline * 100)
+            continue
+        normalized_cost_time = cost_time * reference_device_baseline / device_baseline
+        out.append((reference_device_baseline - normalized_cost_time) / reference_device_baseline * 100)
     return out
+
+
+def _speed_growth_vs_best(kept: list[dict], series: list[Optional[float]]) -> Optional[tuple[str, str]]:
+    """速度提升度小字徽章：跟「目前為止最好的那一筆 keep」比，不是只跟上一筆
+    比——上一筆不一定是目前最好的，跟「目前最好」比才能看出這次改動有沒有
+    真的創新高，並在後面附上那筆最佳紀錄的日期方便對照。資料不足兩筆就回傳
+    None，讓呼叫端 fallback 回原本的邏輯。"""
+    pairs = [(r, v) for r, v in zip(kept, series) if v is not None]
+    if len(pairs) < 2:
+        return None
+    _, latest_v = pairs[-1]
+    history = pairs[:-1]
+    best_row, best_v = max(history, key=lambda pair: pair[1])
+    growth = latest_v - best_v
+    date_str = _fmt_date(best_row.get("_ts"))[:10] if best_row.get("_ts") else "未知日期"
+    growth_str = f"{growth:+.1f}%（vs {date_str} 最佳）"
+    growth_class = "up" if growth >= 0 else "down"
+    return growth_str, growth_class
 
 
 def _coverage_baseline(all_kept: list[dict]) -> Optional[float]:
@@ -241,21 +317,22 @@ def _redundancy_improvement_series(kept: list[dict], baseline: Optional[float]) 
 
 
 METRICS = {
+    # cost_time 沒有填 "baseline_fn"／"series_fn"（下面其他指標都有）：它需要
+    # rebaseline 查詢表跟參考設備基準這些額外資料，改在 render_page() 裡特別
+    # 處理，不走下面這個通用迴圈，見那邊的註解。
     "cost_time": {
         "label": "速度提升度",
         "desc": (
-            "跟最原始 baseline 比，這次跑得快了幾 %（正向表示，越高越好）——"
-            "但這是跟很久以前記錄的歷史數字比，機器負載如果在不同時段差很多，"
-            "這個累積 % 可能會失真（明明有進步卻顯示一大截負成長）。滑鼠移到"
-            "下面圖上的每個點，如果有「同時段重測基準」的資訊，那才是排除機器"
-            "負載干擾、比較準確反映這次改動實際效果的數字。"
+            "跟最原始 baseline 比，累積快了幾 %（正向表示，越高越好）。2026-08-14 起改用"
+            "「設備基準正規化」：每次 Hermes 開始執行前都會重測一次最原始 baseline 的程式碼，"
+            "把每一筆的秒數換算成「如果在參考設備狀態下會測到幾秒」再比較，排除機器負載跨天"
+            "波動的干擾（不再是直接拿原始秒數相減）。小字徽章是跟「目前為止最好的那一筆」比，"
+            "不是只跟上一筆比。"
         ),
         "unit": "%",
         "higher_is_better": True,
         "color": "#4f8cff",
         "baseline_relative": True,
-        "baseline_fn": _speed_baseline,
-        "series_fn": _speed_improvement_series,
     },
     "quality_pass_rate": {
         "label": "組裝正確率",
@@ -525,6 +602,8 @@ def _minicard_html(
     qs_keep: str,
     extra_line: str = "",
     card_value_override: Optional[str] = None,
+    growth_override: Optional[tuple[str, str]] = None,
+    warning_line: str = "",
 ) -> str:
     clean = [v for v in series if v is not None]
     if len(clean) >= 2:
@@ -549,6 +628,13 @@ def _minicard_html(
         growth_class = ""
         latest = "—"
 
+    # 速度提升度卡片：小字徽章改成「比目前為止最好的那一筆 keep 進步了幾個
+    # 百分點」並附上那筆最佳紀錄的日期，而不是只跟上一筆比——上一筆不一定是
+    # 目前最好的（中間可能有一段時間曲線下降過），跟「目前最好」比才能看出
+    # 這次改動有沒有真的創新高。
+    if growth_override is not None:
+        growth_str, growth_class = growth_override
+
     # content_coverage 這類指標的「大數字」改顯示原始絕對值（例如 99.96%），
     # 不是跟 baseline 的差值——差值本身在還沒有任何嘗試動到內容邏輯時永遠是
     # 0，看起來像沒資料，改成絕對值後 100% 才能直觀對應「完全沒丟東西」，
@@ -563,12 +649,19 @@ def _minicard_html(
     extra_line_html = (
         f'<div class="metric-card-extra">{html.escape(extra_line)}</div>' if extra_line else ""
     )
+    # 「設備基準異常」警示：這次 session 一開始量到的設備基準跟參考值差太多
+    # （見 program.md「開始每次執行前：設備基準測量」），只在 cost_time 卡片
+    # 顯示，因為只有這個指標的計算會被設備基準污染。
+    warning_line_html = (
+        f'<div class="metric-card-warning">⚠️ {html.escape(warning_line)}</div>' if warning_line else ""
+    )
     return (
         f'<a class="metric-card{active_class}" href="{html.escape(href)}">'
         f'<div class="metric-card-label">{html.escape(cfg["label"])}</div>'
         f'<div class="metric-card-value">{latest}</div>'
         f'<div class="metric-card-growth {growth_class}">{growth_str}</div>'
         f"{extra_line_html}"
+        f"{warning_line_html}"
         f'<div class="metric-card-spark">{spark}</div>'
         f"</a>"
     )
@@ -597,11 +690,25 @@ def render_page(query: dict) -> str:
         qs_keep += f"&end={html.escape(end)}"
 
     # 每個指標的 baseline 都從 all_kept 算一次，series 才用（可能被日期篩選過的）
-    # kept 算要顯示的點。
+    # kept 算要顯示的點。cost_time 不在這個通用迴圈裡算（見 METRICS 字典裡的
+    # 註解）——它需要 rebaseline 查詢表跟參考設備基準，這兩個都得從「完整、未經
+    # 日期篩選」的 all_rows 算，理由跟其他指標的 baseline 一樣：篩選範圍不能
+    # 影響參考值本身。
     metric_series: dict[str, list[Optional[float]]] = {}
     for key, cfg in METRICS.items():
+        if key == "cost_time":
+            continue
         baseline = cfg["baseline_fn"](all_kept)
         metric_series[key] = cfg["series_fn"](kept, baseline)
+
+    reference_device_baseline = _reference_device_baseline(all_rows)
+    rebaseline_lookup = _rebaseline_lookup(all_rows)
+    metric_series["cost_time"] = _speed_improvement_series(kept, reference_device_baseline, rebaseline_lookup)
+
+    # --- 設備基準異常警示：取「完整、未經日期篩選」歷史裡最新一筆的異常註記，
+    # 不受目前的日期篩選影響，反映的是「現在」的設備狀態，不是篩選範圍內的
+    # 某個舊狀態。---
+    device_anomaly_warning = all_rows[-1].get("_device_anomaly_note") if all_rows else ""
 
     # --- 距離通知門檻 ---
     speed_clean = [v for v in metric_series["cost_time"] if v is not None]
@@ -629,6 +736,9 @@ def render_page(query: dict) -> str:
     content_coverage_card_value = (
         f"{latest_coverage * 100:.2f}%" if latest_coverage is not None else None
     )
+    # 速度提升度的小字徽章改成「跟目前為止最好的那一筆 keep 比」，理由見
+    # `_speed_growth_vs_best` 的註解。
+    speed_growth_override = _speed_growth_vs_best(kept, metric_series["cost_time"])
     minicards = "".join(
         _minicard_html(
             key,
@@ -638,6 +748,8 @@ def render_page(query: dict) -> str:
             qs_keep,
             extra_line=cost_time_extra if key == "cost_time" else "",
             card_value_override=content_coverage_card_value if key == "content_coverage" else None,
+            growth_override=speed_growth_override if key == "cost_time" else None,
+            warning_line=device_anomaly_warning if key == "cost_time" else "",
         )
         for key, cfg in METRICS.items()
     )
@@ -669,7 +781,9 @@ def render_page(query: dict) -> str:
     big_desc = cfg["desc"]
 
     # --- 右側統計 ---
-    total = len(rows)
+    # 「總實驗數」只算真正的實驗嘗試（keep/discard/crash），rebaseline 是
+    # 2026-08-14 設備基準機制的一次性回測資料，不是新的實驗嘗試，不計入。
+    total = sum(1 for r in rows if r.get("status") in ("keep", "discard", "crash"))
     kept_n = len(kept)
     discarded_n = sum(1 for r in rows if r.get("status") == "discard")
     crashed_n = sum(1 for r in rows if r.get("status") == "crash")
@@ -760,6 +874,7 @@ h1 {{ font-size: 1.5rem; margin: 0 0 0.2rem; }}
 .metric-card-growth.up {{ color: #2e9e4a; }}
 .metric-card-growth.down {{ color: #e05353; }}
 .metric-card-extra {{ font-size: 0.72rem; color: var(--muted); margin-top: 0.15rem; }}
+.metric-card-warning {{ font-size: 0.72rem; color: #d99a2b; margin-top: 0.15rem; font-weight: 600; }}
 .metric-card.active {{ outline: 2px solid var(--accent); }}
 .composite-panel {{ display: flex; justify-content: space-between; align-items: center; gap: 1.5rem; margin-bottom: 1rem; flex-wrap: wrap; }}
 .composite-score {{ font-size: 2.2rem; font-weight: 800; color: var(--accent); }}
@@ -778,6 +893,7 @@ td, th {{ border-bottom: 1px solid var(--border); padding: 5px 8px; text-align: 
 .status-keep {{ color: #2e9e4a; }}
 .status-discard {{ color: #d99a2b; }}
 .status-crash {{ color: #e05353; }}
+.status-rebaseline {{ color: #6c8ebf; }}
 .grid-line {{ stroke: var(--grid); stroke-width: 1; }}
 .axis-label {{ fill: var(--muted); }}
 .empty {{ color: var(--muted); font-size: 0.85rem; }}
