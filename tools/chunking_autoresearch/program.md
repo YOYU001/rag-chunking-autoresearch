@@ -197,9 +197,9 @@ grep "^cost_time:\|^timestamp:" run.log
 每次實驗跑完，記錄進 `results.tsv`（tab 分隔，**不是逗號**，逗號在說明欄位裡
 會出問題）。
 
-表頭跟 10 個欄位。**`timestamp` 固定第一欄、`description` 固定最後一欄**（2026-08-14
+表頭跟 12 個欄位。**`timestamp` 固定第一欄、`description` 固定最後一欄**（2026-08-14
 改成這樣，方便人類直接用純文字編輯器看原始 tsv 也不會被 description 這種長文字欄位
-把後面欄位擠到很遠的地方去）。**未來如果要再新增欄位，一律插在 `same_session_baseline_cost_time`
+把後面欄位擠到很遠的地方去）。**未來如果要再新增欄位，一律插在 `device_anomaly_note`
 跟 `description` 之間，不能加在檔案最後面**——因為最後一欄的位置永遠保留給
 `description`。這跟舊規則（新欄位單純附加在最後）不一樣：dashboard.py／mcp_server.py
 是用 `csv.DictReader` 照欄位名稱讀取、不是照位置，所以順序改變本身不會讓程式讀錯；
@@ -207,7 +207,7 @@ grep "^cost_time:\|^timestamp:" run.log
 migration，不能像以前那樣讓舊資料列直接沿用比較少的欄位數）：
 
 ```
-timestamp	commit	cost_time	quality_pass_rate	content_coverage	seconds	status	redundancy_ratio	same_session_baseline_cost_time	description
+timestamp	commit	cost_time	quality_pass_rate	content_coverage	seconds	status	redundancy_ratio	same_session_baseline_cost_time	device_baseline_cost_time	device_anomaly_note	description
 ```
 
 1. timestamp——直接抄 `run.log` 裡 `harness.py` 印出來的 `timestamp:` 那一行
@@ -219,29 +219,46 @@ timestamp	commit	cost_time	quality_pass_rate	content_coverage	seconds	status	red
 4. quality_pass_rate——crash 的話填 `0.000000`
 5. content_coverage——crash 的話填 `0.000000`
 6. seconds——crash 的話填 `0.000000`
-7. status：`keep`、`discard`、或 `crash`
+7. status：`keep`、`discard`、`crash`，或 `rebaseline`（見下方「設備基準測量」章節，
+   一次性回測歷史資料用的特殊狀態，不算進 keep/discard/crash 統計）
 8. redundancy_ratio——crash 的話填 `0.000000`
 9. same_session_baseline_cost_time——見上方「實驗迴圈」步驟 7，這一輪
-   同時段重測 `attempt_base` 版本量到的 cost_time 中位數；crash 的話填空
-   （不要填 0，crash 那一輪根本沒有做這個重測，填空代表「無此資料」，
+   同時段重測 `attempt_base` 版本量到的 cost_time 中位數；crash、`rebaseline`
+   的話填空（不要填 0，這兩種情況根本沒有做這個重測，填空代表「無此資料」，
    dashboard 會正確當成無資料處理，填 0 反而會被誤讀成有量到一個數字）
-10. 一句話說明這次嘗試了什麼
+10. device_baseline_cost_time——見下方「開始每次執行前：設備基準測量」章節，
+    這次 session 一開始量到的「設備基準」，這次 session 寫進 tsv 的每一列都填
+    同一個值（不管 keep/discard/crash/rebaseline）
+11. device_anomaly_note——這次 session 的設備基準如果跟 `REFERENCE_DEVICE_BASELINE`
+    差超過 15%，這裡填一句話說明（例如「設備基準異常：今日 2.9012 vs 參考值
+    2.4500（+18.4%）」）；沒有異常就留空，不要填「正常」這種字樣（留空 = 無異常
+    是既定慣例，跟其他欄位一致）
+12. 一句話說明這次嘗試了什麼；`rebaseline` 列固定寫「回測 <commit> 建立設備基準」
 
 範例：
 
 ```
-timestamp	commit	cost_time	quality_pass_rate	content_coverage	seconds	status	redundancy_ratio	same_session_baseline_cost_time	description
-2026-08-07T19:03:11+00:00	a1b2c3d	1.012085	1.000000	0.999582	0.111329	keep	0.031205		baseline
-2026-08-07T19:12:44+00:00	b2c3d4e	0.870000	1.000000	0.995000	0.096000	keep	0.028000	0.910000	改用更嚴格的表格偵測
-2026-08-07T19:20:02+00:00	c3d4e5f	1075.000000	1.000000	0.250000	0.085000	discard	0.031000	1.050000	改成過度激進的過濾，內容覆蓋率沒過門檻
-2026-08-07T19:25:19+00:00	d4e5f6g	999999.000000	0.000000	0.000000	0.000000	crash	0.000000		overlap 設成負數
+timestamp	commit	cost_time	quality_pass_rate	content_coverage	seconds	status	redundancy_ratio	same_session_baseline_cost_time	device_baseline_cost_time	device_anomaly_note	description
+2026-08-07T19:03:11+00:00	a1b2c3d	1.012085	1.000000	0.999582	0.111329	keep	0.031205				baseline（機制上線前的舊資料，device_baseline_cost_time 留空）
+2026-08-07T19:12:44+00:00	b2c3d4e	0.870000	1.000000	0.995000	0.096000	keep	0.028000	0.910000			改用更嚴格的表格偵測
+2026-08-07T19:20:02+00:00	c3d4e5f	1075.000000	1.000000	0.250000	0.085000	discard	0.031000	1.050000			改成過度激進的過濾，內容覆蓋率沒過門檻
+2026-08-07T19:25:19+00:00	d4e5f6g	999999.000000	0.000000	0.000000	0.000000	crash	0.000000				overlap 設成負數
+2026-08-14T09:00:00+00:00	a1b2c3d	1.180000	1.000000	0.999582	0.130000	rebaseline	0.031000		1.180000		回測 a1b2c3d 建立設備基準
 ```
 
-**如果你發現既有的 `results.tsv` 表頭還是舊順序（`commit` 開頭、`description` 在
-中間）**：這是 2026-08-14 之前的舊資料，不要自己即興搬移——這件事應該已經由人類
-（透過 Claude Code）用一次性 migration 腳本處理過，你只要確認表頭已經是上面新順序
-就好；如果表頭還是舊的，先回報人類，不要自己動手改表頭或搬移舊資料列，避免跟
-人類同時進行的 migration 互相打架。
+**注意**：上面前 4 筆是機制上線前的舊資料範例，故意把 `device_baseline_cost_time`
+留空——這才是機制上線前舊 `keep`／`discard`／`crash` 紀錄真正該有的樣子（沒有這個
+欄位資料，要靠 `rebaseline` 查詢表回填，不是自己就有值）。最後一筆 `rebaseline`
+範例的 `commit` 欄位**故意跟第一筆 `keep`（`a1b2c3d`）一樣**——這不是筆誤：
+`rebaseline` 列的 `commit` 欄位就是「這次回測的是哪個歷史 commit」，dashboard.py
+的 `_rebaseline_lookup()` 就是拿這個欄位當查詢鍵去比對，跟原本那筆 `keep` 紀錄的
+`commit` 必須完全一致，回測資料才找得到對應的舊紀錄——每次寫一筆 `rebaseline`
+列，`commit` 欄位一律填你正在回測的那個歷史 commit 的雜湊值，不要自己另外編一個。
+
+**如果你發現既有的 `results.tsv` 表頭還是舊順序、或欄位數少於 12**：這是 2026-08-14
+之前的舊資料，不要自己即興搬移——這件事應該已經由人類（透過 Claude Code）用一次性
+migration 腳本處理過，你只要確認表頭已經是上面新順序就好；如果表頭還是舊的，先回報
+人類，不要自己動手改表頭或搬移舊資料列，避免跟人類同時進行的 migration 互相打架。
 
 （`results.tsv` 不要進版控，保持 untracked，跟 autoresearch 的做法一樣，
 `.gitignore` 已經排除它。）
@@ -263,6 +280,47 @@ dashboard（`dashboard.py`）讀的是 main checkout 那份，如果你在 workt
 相對路徑寫，資料只會留在 worktree 自己那份，dashboard 永遠看不到，人類也看不到
 你跑過的實驗——這個問題已經真實發生過一次（2026-08-11 那輪的 discard 紀錄整個
 消失在 dashboard 之外），所以務必用絕對路徑，不要再用相對路徑。
+
+## 開始每次執行前：設備基準測量
+
+**這一節不是只做一次的 Setup，是每次你開始執行（不管是排程觸發還是人類手動叫你開始）
+都要先做的第一件事，做完才能進入下面的「實驗迴圈」。**
+
+背景：這台 NAS 的負載會隨時間浮動（不同天、甚至同一天不同時段都可能差很多），導致
+「絕對秒數」沒辦法跨時間公平比較——同一份程式碼，機器忙的時候測起來就是比較慢，看
+起來像退步。上面「實驗迴圈」步驟 7 的「同時段重測」只解決了**同一輪內**（這一輪
+vs. 上一輪）的公平比較，沒解決**跨天、跨 session**的公平比較。這一節要做的是：每次
+開始執行時，先量一次「這台機器現在到底多快」，讓所有資料都能換算回同一把公平的尺。
+
+步驟：
+
+1. **找到最原始的 baseline commit**：`head -n 2 results.tsv | tail -n 1`，取那一列的
+   `commit` 欄位（這是整個實驗史上第一筆 `status=keep` 的紀錄，也就是最原始、從沒
+   被任何優化改過的版本）。
+2. **取出那個 commit 的 `strategy.py`**：`git show <baseline_commit>:strategy.py > /tmp/device_baseline_strategy.py`，
+   暫時複製過去跑（不要用會動到 commit 歷史的方式），**連續跑 3 次** `harness.py`，
+   取 `cost_time` 的中位數，這就是這次 session 的 `device_baseline_cost_time`。
+   跑完記得把 `strategy.py` 換回你目前分支上真正的版本。
+3. **找出 `REFERENCE_DEVICE_BASELINE`**：`results.tsv` 裡**史上第一筆有填
+   `device_baseline_cost_time` 的紀錄**，那個值就是 `REFERENCE_DEVICE_BASELINE`，
+   往後固定不變（除非人類手動決定要重新校準）。如果整份 `results.tsv` 裡完全找不到
+   任何一筆有填這個欄位（代表你是第一次執行這個新機制），那這次量到的
+   `device_baseline_cost_time` 本身就是 `REFERENCE_DEVICE_BASELINE`。
+4. **比對是否異常**：算 `abs(這次的 device_baseline_cost_time - REFERENCE_DEVICE_BASELINE) / REFERENCE_DEVICE_BASELINE`，
+   如果超過 **15%**：
+   - 用 `hermes send --to telegram "<訊息>"` 發一則通知，內容包含今天測到的數字、
+     `REFERENCE_DEVICE_BASELINE`、差距 %（例如「chunking-autoresearch 設備基準異常：
+     今日 2.9012 vs 參考值 2.4500（+18.4%），機器可能比平常忙很多」）。
+   - 準備一句 `device_anomaly_note`（例如「設備基準異常：今日 2.9012 vs 參考值
+     2.4500（+18.4%）」），這次 session 寫進 tsv 的**每一列**都要填這句話。
+   - 沒有超過 15% 就不用發通知，`device_anomaly_note` 這次 session 全部留空。
+5. **這次 session 量到的 `device_baseline_cost_time`（跟上一步準備好的
+   `device_anomaly_note`，如果有的話），要寫進這次 session 之後每一列 tsv 紀錄裡**
+   （見下方「實驗迴圈」步驟 8）——包含 keep、discard、crash 都一樣，都是同一次量到
+   的設備基準，不用每輪重新測一次（每輪重新測太貴，這是 session 等級的量測，不是
+   round 等級）。
+
+做完以上，才進入下面的「實驗迴圈」開始跑第一輪。
 
 ## 實驗迴圈
 
@@ -306,9 +364,10 @@ dashboard（`dashboard.py`）讀的是 main checkout 那份，如果你在 workt
      `run.log` 只用來判斷有沒有 crash，抓到之後就作廢，不進 tsv）。
    - 兩邊測試時間要盡量接近（中間不要插入其他長時間的操作），確保比較
      的公平性。
-8. 把結果記進 tsv（含步驟 7 量到的 `same_session_baseline_cost_time`）——
-   **寫進上面那個固定絕對路徑，不要寫進你目前 worktree 裡的相對路徑版本**
-   （提醒：不要把 `results.tsv` 加進 git）。
+8. 把結果記進 tsv（含步驟 7 量到的 `same_session_baseline_cost_time`，以及這次
+   session 一開始「設備基準測量」量到的 `device_baseline_cost_time`／
+   `device_anomaly_note`，見上方那節）——**寫進上面那個固定絕對路徑，不要寫進
+   你目前 worktree 裡的相對路徑版本**（提醒：不要把 `results.tsv` 加進 git）。
 9. **用「這一輪的 cost_time」跟「步驟 7 量到的 same_session_baseline_cost_time」
    比較**（不是跟歷史上最原始的 baseline 比）：如果進步了（變低）**而且
    `hard_gate_passed` 是 `True`**，保留這個 commit（status 記 `keep`），
@@ -354,10 +413,14 @@ GPU 訓練場景。這裡改成**有明確的硬性停止條件**（達到任何
   這條「系統性問題」的煞車不因為想跑滿 24 小時而放寬），或
 - **連續 30 次都是 discard、沒有任何一次 keep**（代表已經找不到新方向了，
   同樣不因為想跑滿 24 小時而放寬），或
-- **`cost_time` 比一開始的 baseline 進步超過 20%**——這代表已經有夠好的候選了，
-  接下來要不要花錢接上真的 embedding API 做搜尋準確度驗證，是人類要自己
-  決定、自己用 `.claude/skills/api-cost-estimate/` 估算成本的事，不是你
-  可以自己決定去做的。
+- **換算成「設備基準正規化後」的提升度比一開始的 baseline 進步超過 20%**（2026-08-14
+  起：不是直接拿原始 `cost_time` 跟最原始 baseline 的原始 `cost_time` 相減，因為那
+  會被機器負載跨天波動污染；要用 `cost_time × REFERENCE_DEVICE_BASELINE ÷ 這一列的
+  device_baseline_cost_time` 換算成「正規化後」的數字，再跟 `REFERENCE_DEVICE_BASELINE`
+  比，這樣才是排除機器負載干擾後的真實提升度，`dashboard.py` 的「速度提升度」大數字
+  也是用同一套算法）——這代表已經有夠好的候選了，接下來要不要花錢接上真的
+  embedding API 做搜尋準確度驗證，是人類要自己決定、自己用
+  `.claude/skills/api-cost-estimate/` 估算成本的事，不是你可以自己決定去做的。
 
 在跑到以上任何一個條件之前，不要主動停下來問人類「要繼續嗎」——正常情況
 下就是照這個迴圈一直跑。觸發任何一個停止條件後，整理一段摘要（最好的
