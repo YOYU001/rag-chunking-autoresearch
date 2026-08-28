@@ -24,8 +24,18 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-RESULTS_TSV = Path(__file__).resolve().parent / "results.tsv"
-LAST_NOTIFIED_FILE = Path(__file__).resolve().parent / ".last_notified"
+# 一定要指到 main checkout 那份固定路徑，不能用「這支腳本自己在哪裡」去推算
+# ——notify.py 是有進版控的檔案，Hermes 常常是在 worktree（例如
+# .worktrees/chunking-autoresearch/）裡執行它，這時候 __file__ 指到的就會是
+# worktree 自己那份幾乎沒資料的 results.tsv，不是 program.md 規定要讀寫的那份
+# 固定路徑；跟 program.md「記錄結果」章節說明的、以及 2026-08-11 那次
+# harness.py 相對路徑事故是同一類 bug。固定路徑不存在（例如在非 NAS 環境本機
+# 測試）時才退回用檔案所在資料夾，方便開發測試。
+_FIXED_RESULTS_TSV = Path(
+    "/workspace/projects/AI-Benchmark-and-Evaluation-Platform/tools/chunking_autoresearch/results.tsv"
+)
+RESULTS_TSV = _FIXED_RESULTS_TSV if _FIXED_RESULTS_TSV.exists() else Path(__file__).resolve().parent / "results.tsv"
+LAST_NOTIFIED_FILE = RESULTS_TSV.parent / ".last_notified"
 IMPROVEMENT_THRESHOLD_PCT = 20.0
 
 
@@ -154,9 +164,23 @@ def main() -> None:
         f"參考設備基準：{reference_device_baseline:.6f}）\n"
         f"說明：{best.get('description', '')}"
     )
-    subprocess.run(["hermes", "send", "--to", "telegram", message], check=True)
-    LAST_NOTIFIED_FILE.write_text(best["commit"], encoding="utf-8")
+    # 上面的 THRESHOLD_STATUS 已經是這次執行唯一、正確的門檻判斷結果；下面發送
+    # Telegram 失敗是另一件事（純遞送問題，不代表門檻判斷有變），刻意不讓它
+    # 往外拋出、變成第二行 THRESHOLD_STATUS（那會被誤讀成「不知道有沒有跨過
+    # 門檻」，跟已經印出的正確結果互相矛盾）——用不同的前綴記錄下來即可。
+    try:
+        subprocess.run(["hermes", "send", "--to", "telegram", message], check=True)
+        LAST_NOTIFIED_FILE.write_text(best["commit"], encoding="utf-8")
+    except (subprocess.CalledProcessError, OSError) as exc:
+        print(f"NOTIFY_SEND_FAILED: reason={type(exc).__name__}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        # main() 承諾一律印出 THRESHOLD_STATUS，讓 Hermes 不用檢查 exit code；
+        # 未預期的例外（檔案壞掉、格式錯誤等）也要遵守這個承諾，印出來再往上
+        # 拋，不能悄悄吞掉。
+        print(f"THRESHOLD_STATUS: crossed=unknown reason=exception_{type(exc).__name__}")
+        raise
