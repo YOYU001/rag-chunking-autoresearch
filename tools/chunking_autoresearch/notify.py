@@ -95,9 +95,13 @@ def _last_notified_commit() -> Optional[str]:
 
 
 def main() -> None:
+    """一律印出目前的判斷結果到 stdout（給 Hermes 讀，不能只看 exit code 或
+    有沒有發 Telegram——同一個跨過門檻的 commit 因為去重機制不會重複通知，
+    但門檻狀態本身還是要能被觀察到）。"""
     all_rows = _read_rows()
     kept = [r for r in all_rows if r.get("status") == "keep"]
     if len(kept) < 2:
+        print("THRESHOLD_STATUS: crossed=unknown reason=keep_rows_不足2筆")
         return
 
     reference_device_baseline = _reference_device_baseline(all_rows)
@@ -106,6 +110,7 @@ def main() -> None:
         # 還沒有任何一筆 device_baseline_cost_time 資料（設備基準機制還沒
         # 開始跑過一次），沒有正規化的依據，先不判斷、不通知，等機制真正
         # 上線後再說。
+        print("THRESHOLD_STATUS: crossed=unknown reason=無_REFERENCE_DEVICE_BASELINE")
         return
 
     scored = [
@@ -113,15 +118,32 @@ def main() -> None:
     ]
     scored = [(r, normalized) for r, normalized in scored if normalized is not None]
     if not scored:
+        print("THRESHOLD_STATUS: crossed=unknown reason=無_keep_列可換算正規化數字")
         return
 
     best, best_normalized = min(scored, key=lambda pair: pair[1])
     pct = (reference_device_baseline - best_normalized) / reference_device_baseline * 100
+    crossed = pct >= IMPROVEMENT_THRESHOLD_PCT
 
-    if pct < IMPROVEMENT_THRESHOLD_PCT:
+    if not crossed:
+        print(
+            f"THRESHOLD_STATUS: crossed={crossed} pct={pct:.2f} "
+            f"threshold={IMPROVEMENT_THRESHOLD_PCT:.0f} best_commit={best['commit']}"
+        )
         return
     if best["commit"] == _last_notified_commit():
+        print(
+            f"THRESHOLD_STATUS: crossed={crossed} pct={pct:.2f} "
+            f"threshold={IMPROVEMENT_THRESHOLD_PCT:.0f} best_commit={best['commit']} "
+            f"reason=already_notified"
+        )
         return
+
+    print(
+        f"THRESHOLD_STATUS: crossed={crossed} pct={pct:.2f} "
+        f"threshold={IMPROVEMENT_THRESHOLD_PCT:.0f} best_commit={best['commit']} "
+        f"reason=new_notification"
+    )
 
     raw_cost_time = _safe_float(best.get("cost_time"))
     raw_cost_time_str = f"{raw_cost_time:.6f}" if raw_cost_time is not None else best.get("cost_time", "")
