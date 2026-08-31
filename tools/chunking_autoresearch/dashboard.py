@@ -598,25 +598,22 @@ def _big_chart_svg(
 _STATUS_DOT_COLOR = {"keep": "#2e9e4a", "discard": "#d99a2b", "crash": "#e05353"}
 
 
-def _truncate_label(text: str, max_len: int = 16) -> str:
-    text = (text or "").strip()
-    return text if len(text) <= max_len else text[: max_len - 1].rstrip() + "…"
-
-
 def _progress_overview_svg(
     all_rows: list[dict],
     reference_device_baseline: Optional[float],
     rebaseline_lookup: dict[str, dict],
     width: int = 900,
-    height: int = 440,
+    height: int = 380,
 ) -> str:
     """研究進度總覽：仿照 Karpathy 原始 autoresearch 專案的 `progress.png`
     （x 軸是實驗次序、y 軸是正規化後的速度提升度，discard/crash 畫成背景灰點，
-    keep 畫成綠點，另外疊一條只在「刷新目前最佳」時才往上走的階梯線，在每個
-    刷新最佳的點旁邊標註那次改動的說明）。跟現有的「速度提升度」大圖表是兩張
-    不同用途的圖：那張只畫 kept、x 軸是日期，方便看單一指標隨時間的走勢；這張
-    畫全部嘗試（含失敗的），x 軸是實驗次序，方便一眼看出「總共試了幾次、進步
-    集中發生在哪幾次」的整體樣貌。"""
+    keep 畫成綠點，另外疊一條只在「刷新目前最佳」時才往上走的階梯線）。跟現有
+    的「速度提升度」大圖表是兩張不同用途的圖：那張只畫 kept、x 軸是日期，方便
+    看單一指標隨時間的走勢；這張畫全部嘗試（含失敗的），x 軸是實驗次序，方便
+    一眼看出「總共試了幾次、進步集中發生在哪幾次」的整體樣貌。2026-08-31 起
+    拿掉了直接寫在圖上的改動說明文字（實驗一多會互相重疊看不清楚），改成只靠
+    滑鼠移過去的 tooltip 看完整說明，圖上保持乾淨，另外把 x 軸標上實際的輪數
+    刻度方便對照。"""
     experiments = [r for r in all_rows if r.get("status") in ("keep", "discard", "crash")]
     total = len(experiments)
     kept_n = sum(1 for r in experiments if r.get("status") == "keep")
@@ -669,12 +666,11 @@ def _progress_overview_svg(
             running_best = p["value"]
             milestones.append(p)
 
-    # top_pad／right_pad 留比較大的空間：milestone 的文字標註是往右上方斜著寫的
-    # （rotate(-28)），最新一筆 milestone 常常剛好卡在圖表最右邊、y 值也常常是
-    # 目前最高（最靠近圖表頂端），如果留白不夠，最重要的那筆（最新的最佳紀錄）
-    # 標籤就會被裁到 SVG 邊界外面看不到——這個問題本機測試時被抓到過，固定抓一個
-    # 對角線文字最長可能延伸出去的安全邊界，不要只留剛好放得下圓點的空間。
-    left_pad, top_pad, right_pad, bottom_pad = 56, 130, 230, 46
+    # bottom_pad 留夠三層東西的空間（由上到下）：crash 三角形標記、x 軸「第幾輪」
+    # 刻度文字、x 軸標題。milestone 不再往圖上寫斜體說明文字了（改成只靠 tooltip
+    # 看，見下方 x_ticks 那段的註解），所以 top_pad／right_pad 不用再留給文字
+    # 標籤的安全邊界，跟其他圖表一樣用一般的留白就好。
+    left_pad, top_pad, right_pad, bottom_pad = 56, 26, 24, 68
     max_x = max(p["x"] for p in (scatter + crash_points))
     width = max(width, left_pad + right_pad + max_x * 9)
     plot_w = width - left_pad - right_pad
@@ -771,20 +767,34 @@ def _progress_overview_svg(
             f'onmouseenter="showTip(event,this)" onmousemove="moveTip(event)" onmouseleave="hideTip()"></circle>'
         )
 
-    # 文字標註：只標 milestone（刷新最佳的那幾筆），沿對角線方向往右上寫，
-    # 呼應參考圖表的呈現方式；描述文字截斷避免互相重疊。
-    labels = []
-    for m in milestones:
-        x, y = x_at(m["x"]), y_at(m["value"])
-        text = html.escape(_truncate_label(m["description"]))
-        labels.append(
-            f'<text x="{x + 6:.1f}" y="{y - 6:.1f}" font-size="10" fill="#2e9e4a" '
-            f'transform="rotate(-28 {x + 6:.1f} {y - 6:.1f})">{text}</text>'
+    # 2026-08-31 起拿掉了原本沿對角線寫在圖上的改動說明文字——實驗次數一多，
+    # 這些斜寫的文字會互相疊在一起看不清楚（使用者截圖回報過這個問題），改成
+    # 只靠滑鼠移過去的 tooltip 看完整說明，圖上維持乾淨。取而代之的是把 x 軸
+    # 標上「第幾輪」的刻度，方便對照。
+
+    # x 軸刻度：實驗次數少的時候每輪都標，次數一多改成每 5／10／20 輪標一次，
+    # 不然刻度文字會互相擠在一起重疊。一律確保第 1 輪跟最後一輪都有標籤，
+    # 讓人看得出總範圍，不是只看得到中間那幾個整數倍數的刻度。
+    if max_x <= 20:
+        step = 1
+    elif max_x <= 60:
+        step = 5
+    elif max_x <= 150:
+        step = 10
+    else:
+        step = 20
+    tick_xs = sorted({1, *range(step, max_x + 1, step), max_x})
+    x_ticks = []
+    for tx in tick_xs:
+        anchor = "start" if tx == 1 else ("end" if tx == max_x else "middle")
+        x_ticks.append(
+            f'<text x="{x_at(tx):.1f}" y="{top_pad + plot_h + 24:.1f}" font-size="10" '
+            f'class="axis-label" text-anchor="{anchor}">{tx}</text>'
         )
 
     x_axis_title = (
         f'<text x="{left_pad + plot_w / 2:.1f}" y="{height - 6}" font-size="11" class="axis-label" '
-        f'text-anchor="middle">實驗次序（第幾次嘗試，含失敗的）</text>'
+        f'text-anchor="middle">實驗次序（第幾輪，含失敗的）</text>'
     )
     y_axis_title = (
         f'<text x="14" y="{top_pad + plot_h / 2:.1f}" font-size="11" class="axis-label" text-anchor="middle" '
@@ -797,7 +807,7 @@ def _progress_overview_svg(
         f"{''.join(grid)}"
         f"{''.join(step_segments)}"
         f"{''.join(dots)}"
-        f"{''.join(labels)}"
+        f"{''.join(x_ticks)}"
         f"{x_axis_title}{y_axis_title}"
         f"</svg>"
     )
@@ -814,7 +824,7 @@ def _progress_overview_svg(
     return (
         f'<div class="section-title">{html.escape(title)}</div>'
         f'<div class="subtitle" style="margin-bottom:0.5rem">灰／橘／紅點是每一次嘗試（keep/discard/crash 都畫出來），'
-        "綠色階梯線只在刷新目前最佳紀錄時才往上走，旁邊標註那次改動做了什麼。</div>"
+        "綠色階梯線只在刷新目前最佳紀錄時才往上走；把滑鼠移到點上可以看到那次改動的完整說明。</div>"
         f"{legend}"
         f'<div class="chart-scroll">{svg}</div>'
     )
