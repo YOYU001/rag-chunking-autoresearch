@@ -259,6 +259,36 @@ def _speed_improvement_series(
     return out
 
 
+def _normalized_pct_any(
+    r: dict,
+    reference_device_baseline: Optional[float],
+    rebaseline_lookup: dict[str, dict],
+) -> Optional[float]:
+    """跟 `_speed_improvement_series` 同一條公式，但不限定只吃 `status == "keep"`
+    的列——「研究進度總覽」那張圖需要把 discard／crash 的原始資料點也一起畫出來
+    當背景灰點，用同一套正規化公式才能跟 keep 的點畫在同一個 y 軸上比較。舊資料
+    （2026-08-25 設備基準機制上線之前）如果自己沒有 `device_baseline_cost_time`、
+    `commit` 也沒有對應的 `rebaseline` 回測紀錄（`rebaseline` 只回測過歷史上的
+    `keep` commit，沒有回測過 discard／crash 的 commit），就沒有公平可比的正規化
+    數字，回傳 `None`，呼叫端要略過這種點，不要拿沒正規化過的原始秒數硬畫上去。"""
+    cost_time = r.get("_cost_time")
+    device_baseline = r.get("_device_baseline_cost_time")
+    if (cost_time is None or device_baseline is None) and r.get("commit") in rebaseline_lookup:
+        backfilled = rebaseline_lookup[r["commit"]]
+        cost_time = backfilled["cost_time"]
+        device_baseline = backfilled["device_baseline_cost_time"]
+    if (
+        cost_time is None
+        or device_baseline is None
+        or device_baseline == 0
+        or reference_device_baseline is None
+        or reference_device_baseline == 0
+    ):
+        return None
+    normalized_cost_time = cost_time * reference_device_baseline / device_baseline
+    return (reference_device_baseline - normalized_cost_time) / reference_device_baseline * 100
+
+
 def _speed_growth_vs_best(kept: list[dict], series: list[Optional[float]]) -> Optional[tuple[str, str]]:
     """速度提升度小字徽章：跟「目前為止最好的那一筆 keep」比，不是只跟上一筆
     比——上一筆不一定是目前最好的，跟「目前最好」比才能看出這次改動有沒有
@@ -565,6 +595,231 @@ def _big_chart_svg(
     return f'<div class="chart-scroll">{svg}</div>'
 
 
+_STATUS_DOT_COLOR = {"keep": "#2e9e4a", "discard": "#d99a2b", "crash": "#e05353"}
+
+
+def _truncate_label(text: str, max_len: int = 16) -> str:
+    text = (text or "").strip()
+    return text if len(text) <= max_len else text[: max_len - 1].rstrip() + "…"
+
+
+def _progress_overview_svg(
+    all_rows: list[dict],
+    reference_device_baseline: Optional[float],
+    rebaseline_lookup: dict[str, dict],
+    width: int = 900,
+    height: int = 440,
+) -> str:
+    """研究進度總覽：仿照 Karpathy 原始 autoresearch 專案的 `progress.png`
+    （x 軸是實驗次序、y 軸是正規化後的速度提升度，discard/crash 畫成背景灰點，
+    keep 畫成綠點，另外疊一條只在「刷新目前最佳」時才往上走的階梯線，在每個
+    刷新最佳的點旁邊標註那次改動的說明）。跟現有的「速度提升度」大圖表是兩張
+    不同用途的圖：那張只畫 kept、x 軸是日期，方便看單一指標隨時間的走勢；這張
+    畫全部嘗試（含失敗的），x 軸是實驗次序，方便一眼看出「總共試了幾次、進步
+    集中發生在哪幾次」的整體樣貌。"""
+    experiments = [r for r in all_rows if r.get("status") in ("keep", "discard", "crash")]
+    total = len(experiments)
+    kept_n = sum(1 for r in experiments if r.get("status") == "keep")
+    title = f"研究進度總覽：共 {total} 次實驗、{kept_n} 次留下改進"
+
+    if not experiments:
+        return f'<div class="section-title">{html.escape(title)}</div><p class="empty">（還沒有資料）</p>'
+
+    scatter: list[dict] = []  # 畫得出速度數字的點（keep/discard，crash 另外處理）
+    kept_points: list[dict] = []  # 只有 keep，用來畫「目前最佳」階梯線
+    crash_points: list[dict] = []  # crash 沒有有效的 cost_time，不能套正規化公式
+    for i, r in enumerate(experiments):
+        status = r.get("status") or ""
+        base_info = {
+            "x": i + 1,
+            "status": status,
+            "commit": r.get("commit") or "",
+            "description": r.get("description") or "",
+            "ts": r.get("_ts"),
+        }
+        if status == "crash":
+            # crash 代表這次執行直接壞掉，根本沒測到有效速度——`cost_time`
+            # 依規則是填 0（或某些舊資料是別的無意義佔位值），絕對不能拿去套
+            # 正規化公式當成「這次跑了幾秒」，那樣算出來的百分比毫無意義、
+            # 還會把整張圖的 y 軸尺度炸壞（例如當成 0 秒會變成離譜的正提升，
+            # 當成佔位的大數字又會變成離譜的負提升）。只記 x 位置，不算 y 值。
+            crash_points.append(base_info)
+            continue
+        pct = _normalized_pct_any(r, reference_device_baseline, rebaseline_lookup)
+        if pct is None:
+            continue
+        point = {**base_info, "value": pct}
+        scatter.append(point)
+        if status == "keep":
+            kept_points.append(point)
+
+    if not scatter and not crash_points:
+        return (
+            f'<div class="section-title">{html.escape(title)}</div>'
+            '<p class="empty">（還沒有可正規化比較的資料——設備基準機制上線之後才會有）</p>'
+        )
+
+    # 找出「目前最佳」的刷新點：依時間序走一遍 kept_points，只要比目前看過的
+    # 最大值還大，就是一次刷新，記下來畫階梯線跟文字標註；其餘 keep 點仍畫成
+    # 綠點，但不進這條線、也不加文字，避免標籤多到互相重疊看不清楚。
+    milestones: list[dict] = []
+    running_best = float("-inf")
+    for p in kept_points:
+        if p["value"] > running_best:
+            running_best = p["value"]
+            milestones.append(p)
+
+    # top_pad／right_pad 留比較大的空間：milestone 的文字標註是往右上方斜著寫的
+    # （rotate(-28)），最新一筆 milestone 常常剛好卡在圖表最右邊、y 值也常常是
+    # 目前最高（最靠近圖表頂端），如果留白不夠，最重要的那筆（最新的最佳紀錄）
+    # 標籤就會被裁到 SVG 邊界外面看不到——這個問題本機測試時被抓到過，固定抓一個
+    # 對角線文字最長可能延伸出去的安全邊界，不要只留剛好放得下圓點的空間。
+    left_pad, top_pad, right_pad, bottom_pad = 56, 130, 230, 46
+    max_x = max(p["x"] for p in (scatter + crash_points))
+    width = max(width, left_pad + right_pad + max_x * 9)
+    plot_w = width - left_pad - right_pad
+    plot_h = height - top_pad - bottom_pad
+
+    values = [p["value"] for p in scatter]
+    # scatter 可能整批都是空的（例如所有實驗剛好都 crash、還沒有任何 keep/discard
+    # 測到有效速度）——這種情況沒有速度數字可以決定 y 軸範圍，退回一個中性的
+    # 0%~1% 區間，圖表只會顯示底部那排 crash 標記，不會因為 min()/max() 對空
+    # list 報錯而整頁掛掉。
+    lo, hi = (min(0.0, min(values)), max(values)) if values else (0.0, 1.0)
+    if lo == hi:
+        lo, hi = lo - 1, hi + 1
+    span = hi - lo
+
+    def x_at(x: int) -> float:
+        return left_pad + (x - 1) / max(max_x - 1, 1) * plot_w
+
+    def y_at(v: float) -> float:
+        return top_pad + plot_h - (v - lo) / span * plot_h
+
+    grid = []
+    ticks = 4
+    for t in range(ticks + 1):
+        val = lo + span * t / ticks
+        y = y_at(val)
+        grid.append(
+            f'<line x1="{left_pad}" y1="{y:.1f}" x2="{width - right_pad}" y2="{y:.1f}" class="grid-line" />'
+            f'<text x="{left_pad - 8:.1f}" y="{y + 4:.1f}" font-size="11" class="axis-label" '
+            f'text-anchor="end">{val:.0f}%</text>'
+        )
+
+    # 階梯線：從第一個 milestone（第一筆 keep，通常就是 baseline 自己）開始，
+    # 每次刷新最佳就先畫一段水平線接到新的 x，再垂直跳到新的 y——只在真的
+    # 刷新時才畫線段，中間那些沒刷新的 keep 點不連進這條線。
+    step_segments = []
+    if milestones:
+        prev_y = y_at(milestones[0]["value"])
+        path = f"M{x_at(milestones[0]['x']):.1f},{prev_y:.1f}"
+        for m in milestones[1:]:
+            nx, ny = x_at(m["x"]), y_at(m["value"])
+            path += f" L{nx:.1f},{prev_y:.1f} L{nx:.1f},{ny:.1f}"
+            prev_y = ny
+        # 延伸到最後一個實驗的 x，代表「目前最佳」一直保持到現在
+        path += f" L{x_at(max_x):.1f},{prev_y:.1f}"
+        step_segments.append(
+            f'<path d="{path}" fill="none" stroke="#2e9e4a" stroke-width="2.5" '
+            f'stroke-linecap="round" stroke-linejoin="round" />'
+        )
+
+    # crash 標記：畫在圖表最底部的固定高度（不對應任何速度數字，crash 本來就
+    # 沒有有效的 cost_time 可畫），用一個小三角形跟其他圓點區分開，純粹標示
+    # 「這個實驗次序上發生過 crash」，只靠 x 位置提供資訊。
+    crash_y = top_pad + plot_h + 6
+    dots = []
+    for p in crash_points:
+        x = x_at(p["x"])
+        tooltip = html.escape(f"第 {p['x']} 次實驗（{p['commit']}，crash）\n{p['description']}").replace(
+            "\n", "&#10;"
+        )
+        dots.append(
+            f'<path d="M{x:.1f},{crash_y - 4:.1f} L{x - 4:.1f},{crash_y + 4:.1f} L{x + 4:.1f},{crash_y + 4:.1f} Z" '
+            f'fill="{_STATUS_DOT_COLOR["crash"]}" opacity="0.75" class="chart-point" data-tip="{tooltip}" '
+            f'onmouseenter="showTip(event,this)" onmousemove="moveTip(event)" onmouseleave="hideTip()"></path>'
+        )
+
+    # 背景灰點（discard）先畫，keep 的綠點後畫，milestone 再疊最上層，
+    # 確保重要的點不會被一般的點蓋住。
+    for p in scatter:
+        if p["status"] == "keep":
+            continue
+        x, y = x_at(p["x"]), y_at(p["value"])
+        tooltip = html.escape(
+            f"第 {p['x']} 次實驗（{p['commit']}，{p['status']}）：{p['value']:.2f}%\n{p['description']}"
+        ).replace("\n", "&#10;")
+        dots.append(
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" fill="{_STATUS_DOT_COLOR.get(p["status"], "#8fa3b8")}" '
+            f'opacity="0.55" class="chart-point" data-tip="{tooltip}" '
+            f'onmouseenter="showTip(event,this)" onmousemove="moveTip(event)" onmouseleave="hideTip()"></circle>'
+        )
+    milestone_xs = {m["x"] for m in milestones}
+    for p in kept_points:
+        x, y = x_at(p["x"]), y_at(p["value"])
+        is_milestone = p["x"] in milestone_xs
+        r_px = 6.5 if is_milestone else 4.5
+        stroke = ' stroke="#ffffff" stroke-width="1.5"' if is_milestone else ""
+        tooltip = html.escape(
+            f"第 {p['x']} 次實驗（{p['commit']}，keep{'，目前最佳' if is_milestone else ''}）："
+            f"{p['value']:.2f}%\n{p['description']}"
+        ).replace("\n", "&#10;")
+        dots.append(
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r_px}" fill="{_STATUS_DOT_COLOR["keep"]}"{stroke} '
+            f'class="chart-point" data-tip="{tooltip}" '
+            f'onmouseenter="showTip(event,this)" onmousemove="moveTip(event)" onmouseleave="hideTip()"></circle>'
+        )
+
+    # 文字標註：只標 milestone（刷新最佳的那幾筆），沿對角線方向往右上寫，
+    # 呼應參考圖表的呈現方式；描述文字截斷避免互相重疊。
+    labels = []
+    for m in milestones:
+        x, y = x_at(m["x"]), y_at(m["value"])
+        text = html.escape(_truncate_label(m["description"]))
+        labels.append(
+            f'<text x="{x + 6:.1f}" y="{y - 6:.1f}" font-size="10" fill="#2e9e4a" '
+            f'transform="rotate(-28 {x + 6:.1f} {y - 6:.1f})">{text}</text>'
+        )
+
+    x_axis_title = (
+        f'<text x="{left_pad + plot_w / 2:.1f}" y="{height - 6}" font-size="11" class="axis-label" '
+        f'text-anchor="middle">實驗次序（第幾次嘗試，含失敗的）</text>'
+    )
+    y_axis_title = (
+        f'<text x="14" y="{top_pad + plot_h / 2:.1f}" font-size="11" class="axis-label" text-anchor="middle" '
+        f'transform="rotate(-90 14 {top_pad + plot_h / 2:.1f})">正規化後速度提升度（%，越高越好）</text>'
+    )
+
+    svg = (
+        f'<svg viewBox="0 0 {width} {height}" width="{width}" height="{height}" role="img" '
+        f'style="display:block;min-width:{width}px">'
+        f"{''.join(grid)}"
+        f"{''.join(step_segments)}"
+        f"{''.join(dots)}"
+        f"{''.join(labels)}"
+        f"{x_axis_title}{y_axis_title}"
+        f"</svg>"
+    )
+
+    legend = (
+        '<div class="overview-legend">'
+        '<span><i style="background:#d99a2b"></i>discard</span>'
+        '<span><i style="background:#e05353"></i>crash</span>'
+        '<span><i style="background:#2e9e4a"></i>keep</span>'
+        '<span><i style="background:#2e9e4a;width:14px;height:3px;border-radius:0"></i>目前最佳（階梯線）</span>'
+        "</div>"
+    )
+
+    return (
+        f'<div class="section-title">{html.escape(title)}</div>'
+        f'<div class="subtitle" style="margin-bottom:0.5rem">灰／橘／紅點是每一次嘗試（keep/discard/crash 都畫出來），'
+        "綠色階梯線只在刷新目前最佳紀錄時才往上走，旁邊標註那次改動做了什麼。</div>"
+        f"{legend}"
+        f'<div class="chart-scroll">{svg}</div>'
+    )
+
+
 def _growth_pct(first: float, last: float, higher_is_better: bool) -> float:
     if first == 0:
         return 0.0
@@ -704,6 +959,12 @@ def render_page(query: dict) -> str:
     reference_device_baseline = _reference_device_baseline(all_rows)
     rebaseline_lookup = _rebaseline_lookup(all_rows)
     metric_series["cost_time"] = _speed_improvement_series(kept, reference_device_baseline, rebaseline_lookup)
+
+    # 「研究進度總覽」用完整、未經日期篩選的歷史（跟 baseline／參考設備基準
+    # 一樣的理由：這張圖的用意是呈現整個專案至今的全貌，不應該被目前選的日期
+    # 範圍過濾掉一部分，不然「共 N 次實驗」這個標題數字會跟著篩選條件變動、
+    # 失去「總覽」的意義）。
+    progress_overview_html = _progress_overview_svg(all_rows, reference_device_baseline, rebaseline_lookup)
 
     # --- 設備基準異常警示：取「完整、未經日期篩選」歷史裡最新一筆的異常註記，
     # 不受目前的日期篩選影響，反映的是「現在」的設備狀態，不是篩選範圍內的
@@ -898,6 +1159,9 @@ td, th {{ border-bottom: 1px solid var(--border); padding: 5px 8px; text-align: 
 .axis-label {{ fill: var(--muted); }}
 .empty {{ color: var(--muted); font-size: 0.85rem; }}
 .section-title {{ font-weight: 600; margin-bottom: 0.5rem; }}
+.overview-legend {{ display: flex; gap: 1.1rem; flex-wrap: wrap; font-size: 0.78rem; color: var(--muted); margin-bottom: 0.5rem; }}
+.overview-legend span {{ display: inline-flex; align-items: center; gap: 0.35rem; }}
+.overview-legend i {{ width: 9px; height: 9px; border-radius: 50%; display: inline-block; }}
 .footnote {{ color: var(--muted); font-size: 0.75rem; margin-top: 1rem; }}
 @media (max-width: 900px) {{
   .layout {{ flex-direction: column; }}
@@ -981,6 +1245,10 @@ document.addEventListener('DOMContentLoaded', function() {{
           <div class="metric-card-label">{html.escape(threshold_note)}</div>
           <div class="progress-track"><div class="progress-fill" style="width:{threshold_progress:.0f}%"></div></div>
         </div>
+      </div>
+
+      <div class="panel" style="margin-bottom:1rem">
+        {progress_overview_html}
       </div>
 
       <div class="grid-top">{minicards}</div>
