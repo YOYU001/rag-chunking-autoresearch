@@ -596,6 +596,9 @@ def _big_chart_svg(
 
 
 _STATUS_DOT_COLOR = {"keep": "#2e9e4a", "discard": "#d99a2b", "crash": "#e05353"}
+# program.md「實驗規則」：hard gate 沒過時 cost_time 會被灌成「1000 起跳」的懲罰值，
+# 不是真實秒數，正規化總覽圖遇到這種列要當成無效速度資料處理（跟 crash 同一類）。
+_HARD_GATE_PENALTY_FLOOR = 1000.0
 
 
 def _progress_overview_svg(
@@ -625,6 +628,7 @@ def _progress_overview_svg(
     scatter: list[dict] = []  # 畫得出速度數字的點（keep/discard，crash 另外處理）
     kept_points: list[dict] = []  # 只有 keep，用來畫「目前最佳」階梯線
     crash_points: list[dict] = []  # crash 沒有有效的 cost_time，不能套正規化公式
+    invalid_points: list[dict] = []  # hard gate 沒過的 discard：cost_time 是懲罰值，不是真實速度
     for i, r in enumerate(experiments):
         status = r.get("status") or ""
         base_info = {
@@ -642,6 +646,16 @@ def _progress_overview_svg(
             # 當成佔位的大數字又會變成離譜的負提升）。只記 x 位置，不算 y 值。
             crash_points.append(base_info)
             continue
+        raw_cost_time = r.get("_cost_time")
+        if raw_cost_time is not None and raw_cost_time >= _HARD_GATE_PENALTY_FLOOR:
+            # program.md「實驗規則」明訂：hard gate（quality_pass_rate／
+            # content_coverage／chunk 大小／redundancy_ratio 任一項）沒過的話，
+            # cost_time 會被灌成一個「1000 起跳」的懲罰值，用來保證這個嘗試在
+            # 「誰切得快」的比較裡必輸——這個數字本來就不是真實秒數，套正規化
+            # 公式會被放大成離譜的負值（實測發生過 -90143%），把整張圖的 y 軸
+            # 尺度拉爆。跟 crash 用同一種處理方式：只記 x 位置，不算 y 值。
+            invalid_points.append({**base_info, "raw_cost_time": raw_cost_time})
+            continue
         pct = _normalized_pct_any(r, reference_device_baseline, rebaseline_lookup)
         if pct is None:
             continue
@@ -650,7 +664,7 @@ def _progress_overview_svg(
         if status == "keep":
             kept_points.append(point)
 
-    if not scatter and not crash_points:
+    if not scatter and not crash_points and not invalid_points:
         return (
             f'<div class="section-title">{html.escape(title)}</div>'
             '<p class="empty">（還沒有可正規化比較的資料——設備基準機制上線之後才會有）</p>'
@@ -671,7 +685,7 @@ def _progress_overview_svg(
     # 看，見下方 x_ticks 那段的註解），所以 top_pad／right_pad 不用再留給文字
     # 標籤的安全邊界，跟其他圖表一樣用一般的留白就好。
     left_pad, top_pad, right_pad, bottom_pad = 56, 26, 24, 68
-    max_x = max(p["x"] for p in (scatter + crash_points))
+    max_x = max(p["x"] for p in (scatter + crash_points + invalid_points))
     width = max(width, left_pad + right_pad + max_x * 9)
     plot_w = width - left_pad - right_pad
     plot_h = height - top_pad - bottom_pad
@@ -734,6 +748,22 @@ def _progress_overview_svg(
         dots.append(
             f'<path d="M{x:.1f},{crash_y - 4:.1f} L{x - 4:.1f},{crash_y + 4:.1f} L{x + 4:.1f},{crash_y + 4:.1f} Z" '
             f'fill="{_STATUS_DOT_COLOR["crash"]}" opacity="0.75" class="chart-point" data-tip="{tooltip}" '
+            f'onmouseenter="showTip(event,this)" onmousemove="moveTip(event)" onmouseleave="hideTip()"></path>'
+        )
+
+    # hard gate 沒過的無效點：跟 crash 畫在同一條底部基準線上，用菱形跟 crash
+    # 的三角形、正常點的圓形區分開，顏色沿用該列自己的 status（目前只會是
+    # discard，因為 keep 規則上不可能 hard_gate_passed=False）。
+    for p in invalid_points:
+        x = x_at(p["x"])
+        tooltip = html.escape(
+            f"第 {p['x']} 次實驗（{p['commit']}，{p['status']}，hard gate 未通過）：\n"
+            f"cost_time={p['raw_cost_time']:.2f}（懲罰值，非真實速度，不計入圖表數值）\n{p['description']}"
+        ).replace("\n", "&#10;")
+        dots.append(
+            f'<path d="M{x:.1f},{crash_y - 5:.1f} L{x + 5:.1f},{crash_y:.1f} L{x:.1f},{crash_y + 5:.1f} '
+            f'L{x - 5:.1f},{crash_y:.1f} Z" fill="{_STATUS_DOT_COLOR.get(p["status"], "#8fa3b8")}" '
+            f'opacity="0.75" class="chart-point" data-tip="{tooltip}" '
             f'onmouseenter="showTip(event,this)" onmousemove="moveTip(event)" onmouseleave="hideTip()"></path>'
         )
 
@@ -812,14 +842,18 @@ def _progress_overview_svg(
         f"</svg>"
     )
 
-    legend = (
-        '<div class="overview-legend">'
-        '<span><i style="background:#d99a2b"></i>discard</span>'
-        '<span><i style="background:#e05353"></i>crash</span>'
-        '<span><i style="background:#2e9e4a"></i>keep</span>'
-        '<span><i style="background:#2e9e4a;width:14px;height:3px;border-radius:0"></i>目前最佳（階梯線）</span>'
-        "</div>"
-    )
+    legend_items = [
+        '<span><i style="background:#d99a2b"></i>discard</span>',
+        '<span><i style="background:#e05353"></i>crash</span>',
+        '<span><i style="background:#2e9e4a"></i>keep</span>',
+        '<span><i style="background:#2e9e4a;width:14px;height:3px;border-radius:0"></i>目前最佳（階梯線）</span>',
+    ]
+    if invalid_points:
+        legend_items.append(
+            '<span><i style="background:#d99a2b;border-radius:2px;transform:rotate(45deg)"></i>'
+            "hard gate 未過（懲罰值，不計入數值）</span>"
+        )
+    legend = '<div class="overview-legend">' + "".join(legend_items) + "</div>"
 
     return (
         f'<div class="section-title">{html.escape(title)}</div>'
