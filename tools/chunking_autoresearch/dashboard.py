@@ -598,6 +598,9 @@ def _big_chart_svg(
 _STATUS_DOT_COLOR = {"keep": "#2e9e4a", "discard": "#d99a2b", "crash": "#e05353"}
 # program.md「實驗規則」：hard gate 沒過時 cost_time 會被灌成「1000 起跳」的懲罰值，
 # 不是真實秒數，正規化總覽圖遇到這種列要當成無效速度資料處理（跟 crash 同一類）。
+# 這是 harness.py 的 `HARD_FAILURE_BASE` 同一個數字的獨立副本（dashboard.py 不
+# import harness.py，避免拉入 pdf_utils/schema 等跟畫圖無關的重依賴）——改那邊
+# 記得也要改這裡，兩邊沒有自動同步機制。
 _HARD_GATE_PENALTY_FLOOR = 1000.0
 
 

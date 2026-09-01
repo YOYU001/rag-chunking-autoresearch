@@ -98,6 +98,9 @@ MAX_REDUNDANCY_RATIO = 0.4
 
 # 硬性失敗（quality 或 coverage 沒過門檻）的 cost_time 基準值，遠高於任何正常
 # 執行結果，讓「投機取巧」永遠競爭不過「認真切但慢一點」。
+# dashboard.py 的 `_HARD_GATE_PENALTY_FLOOR` 是同一個數字的獨立副本（拿來判斷
+# 「研究進度總覽」圖裡哪些列是懲罰值、該排除在正規化計算外），改這裡記得也去
+# 改那邊，兩邊沒有 import 關係、不會自動同步。
 HARD_FAILURE_BASE = 1000.0
 
 # baseline 策略（strategy.py 目前的內容）跑出來的中位數秒數，讓
