@@ -358,10 +358,20 @@ vs. 上一輪）的公平比較，沒解決**跨天、跨 session**的公平比�
    `REFERENCE_DEVICE_BASELINE`，**比它更早的所有資料（不管是不是有填
    `device_baseline_cost_time`）在找這個值時一律忽略**。如果完全找不到這種標記列，
    才退回原本的規則：`results.tsv` 裡**史上第一筆有填 `device_baseline_cost_time`
-   的紀錄**就是 `REFERENCE_DEVICE_BASELINE`。往後固定不變（除非人類手動決定要重新
-   校準，或又發生一次下面說明的「量測架構升級」）。如果整份 `results.tsv` 裡完全
-   找不到任何一筆有填這個欄位（代表你是第一次執行這個新機制），那這次量到的
-   `device_baseline_cost_time` 本身就是 `REFERENCE_DEVICE_BASELINE`。
+   的紀錄**就是 `REFERENCE_DEVICE_BASELINE`。往後固定不變，除非人類手動決定要重新
+   校準。如果整份 `results.tsv` 裡完全找不到任何一筆有填這個欄位（代表你是第一次
+   執行這個新機制），那這次量到的 `device_baseline_cost_time` 本身就是
+   `REFERENCE_DEVICE_BASELINE`。
+
+   **這條「量測架構升級」標記列規則目前只設計給 2026-09-01 這一次架構升級用**
+   （`_worker.py` 改成常駐迴圈那次）——`dashboard.py`／`notify.py` 的程式碼是
+   用 `next(...)` 取**時間上最早**的一筆含「量測架構升級」字樣的標記列，不是
+   最新一筆。如果未來又發生一次同類的量測架構變動，**不要沿用同一句「量測架構
+   升級」文字**（那樣新標記列會被舊的蓋過去、規則實質失效，等於又重演一次
+   「新舊架構數字被誤比較」的問題）——必須：(1) 用不同的、能明確區分的
+   description 文字（例如加上日期），(2) 同步請人類修改 `dashboard.py`／
+   `notify.py` 的比對邏輯，改成優先取「最新一筆」而不是「最早一筆」。這是目前
+   規則的已知限制，不是可以無限次重複套用的通用機制。
 
    **為什麼要有這條例外規則**：2026-09-01 `harness.py`／`_worker.py` 把「每次重複
    計時都整個重開一個新 subprocess」改成「常駐一個 subprocess、重複請求共用同一份

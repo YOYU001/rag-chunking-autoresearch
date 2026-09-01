@@ -28,11 +28,23 @@ subprocess」的做法，重開直譯器＋重新 import 佔掉了 88.6% 的 `co
 重複繳的固定成本蓋過去。改成一個 subprocess 生命週期內處理 `TIMING_REPEATS`
 次請求（見 `_run_worker_session()`），import 成本只付一次；計時方式不變，
 仍然是父行程（這裡）用 `time.perf_counter()` 量每次來回的時間，子行程碰不到
-這個計時器，安全隔離性質沒有改變。**這個改動會讓量到的 `BASELINE_SECONDS`
+這個計時器。**這個改動會讓量到的 `BASELINE_SECONDS`
 量級整個下降**（少了重複 import 的固定開銷），部署後第一次「設備基準測量」
 量到的 `device_baseline_cost_time` 會比部署前小很多——這是量測架構升級造成
 的，不是機器突然變快，program.md 已經有對應的 `REFERENCE_DEVICE_BASELINE`
 重新校準規則，不要把這次的落差當成「設備基準異常」處理。
+
+**同一輪 QA 審查另外抓到一個更早就存在的舊漏洞（不是這次新引入，但既然這次
+重點就是重新確立「父行程計時、子行程碰不到」這個安全前提，一併修掉）**：
+`harness.py` 自己過去有 `import strategy`（只是為了讀 `STRATEGY_NAME` 印進
+摘要），但 import 本身就會執行 `strategy.py` 的模組層級程式碼——而這裡就是
+父行程自己的 process，`_run_worker_session()` 用的 `time` 模組是
+`sys.modules['time']` 這個全 process 共用的單例，只要 `strategy.py` 在模組
+層級動一行 monkeypatch，就能直接偽造父行程量到的 `cost_time`（QA 實測證實
+可行：偽造出 `cost_time: 0.000000` 還能通過 hard gate）。改成用純文字 regex
+從 `strategy.py` 原始碼擷取 `STRATEGY_NAME`（見 `_read_strategy_name()`），
+完全不 import、不執行這個檔案裡的任何程式碼，才是真正堵住「父行程碰不到」
+這句話唯一還沒堵住的破口。
 
 用法：python harness.py（或 uv run harness.py）
 """
@@ -41,22 +53,31 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import statistics
 import subprocess
 import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TextIO
 
 from pdf_utils import parse_pdf_pages
 from schema import Chunk, PageParseResult
 
-# 只用來讀 STRATEGY_NAME 這個字串常數放進摘要輸出，不會呼叫 strategy.chunk()
-# ——實際執行 chunk() 一律透過 _worker.py 的 subprocess，不在這個 process
-# 裡跑，所以這裡 import 不影響計時或評分的可信度。schema.py 拆出來之後，
-# strategy.py 已經不會再 import 這個檔案，不會有循環 import。
-import strategy
+# 2026-09-01 QA 審查抓到：這裡原本 `import strategy` 只是為了讀
+# `STRATEGY_NAME` 這個字串常數放進摘要輸出，註解宣稱「不會呼叫
+# strategy.chunk()，所以不影響計時或評分的可信度」——這個推論是錯的。
+# `import` 本身就會執行 `strategy.py` 的**模組層級程式碼**，而這個 process
+# 就是父行程本身，`_run_worker_session()` 拿到的 `time` 模組是
+# `sys.modules['time']` 這個全 process 共用的單例——只要 `strategy.py`
+# 在模組層級動一行 `sys.modules['time'].perf_counter = ...`，就能直接竄改
+# 父行程量到的計時，偽造出無限大的速度提升（已被 QA 實測證實可行，是
+# 這次 worker 常駐化改動之前就存在的舊漏洞，不是這次新引入的，但既然
+# 這次的重點就是重新確立「父行程計時、子行程碰不到」這個安全前提，
+# 這個洞必須一起補起來）。改成用純文字 regex 從 `strategy.py` 的原始碼
+# 擷取 `STRATEGY_NAME`，完全不 import、不執行這個檔案的任何程式碼。
+_STRATEGY_NAME_RE = re.compile(r'^STRATEGY_NAME\s*=\s*["\'](.+?)["\']\s*$', re.MULTILINE)
 
 # ---------------------------------------------------------------------------
 # 固定常數——agent 可以讀，但不能改這個檔案本身
@@ -130,6 +151,7 @@ TIMING_REPEATS = 3
 SUBPROCESS_TIMEOUT_SECONDS = 30
 
 WORKER_SCRIPT = TOOL_DIR / "_worker.py"
+STRATEGY_SCRIPT = TOOL_DIR / "strategy.py"
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +266,7 @@ def redundancy_ratio(chunks: list[Chunk]) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _read_line_with_timeout(stream, timeout: float) -> Optional[str]:
+def _read_line_with_timeout(stream: TextIO, timeout: float) -> Optional[str]:
     """從一個可能會卡住的 pipe 讀一行，最多等 `timeout` 秒。標準函式庫的
     pipe 物件沒有內建的「讀一行、逾時就放棄」功能，且 `select`/`selectors`
     在 Windows 上不支援一般的檔案／pipe（只支援 socket），所以用一個
@@ -267,6 +289,17 @@ def _read_line_with_timeout(stream, timeout: float) -> Optional[str]:
         return None
 
 
+def _drain_stderr(stream: TextIO, out: list[str]) -> None:
+    """持續、非阻塞地把子行程的 stderr 讀進 `out`，在背景 thread 執行，跟主
+    迴圈平行跑（不是等全部重複測完才一次讀）。OS 的 pipe buffer 有限（常見
+    預設約 64KB）：如果只在最後才讀 stderr，子行程一旦寫了夠多內容（不只是
+    crash 的 traceback，一般的 debug print 也算）就會卡在寫入上，連帶讓對應
+    那次 stdout 讀取逾時、把整個 session 誤判成失敗——用一個持續在背景吸收
+    輸出的 thread 才能避免 pipe 被塞滿卡住。"""
+    for line in iter(stream.readline, ""):
+        out.append(line)
+
+
 def _run_worker_session(
     payload: list[dict], repeats: int, timeout: float
 ) -> tuple[Optional[list[dict]], list[float]]:
@@ -275,7 +308,11 @@ def _run_worker_session(
     清單)。任何一次來回逾時、subprocess 提前結束、或回傳的不是合法 JSON，
     直接視為這次 session 失敗，回傳 (None, 目前已經量到的秒數清單)——呼叫端
     看 `len(timings) < repeats` 或 `worker_output is None` 就知道失敗了，
-    跟舊版「任何一次重複 crash 就整個當掉」的語意一致，不是新的行為。
+    跟舊版「任何一次重複 crash 就整個當掉」的語意一致，不是新的行為。**每一次
+    來回收到的回覆都會各自驗證是合法 JSON**（不是只驗證第一次），確保「重複
+    `repeats` 次的每一次都真的是有效回應」這個不變量沒有被弱化——萬一某次
+    重複因為模組層級狀態污染等原因回傳壞掉的內容，那次連同它的計時會被整個
+    session 判定失敗，不會被安靜地算進中位數。
 
     2026-09-01 改成常駐 subprocess（原本是每次重複測時都整個重開一個新
     subprocess）：實測發現直譯器重開＋重新 import `re`／`schema.py`（連帶
@@ -288,7 +325,11 @@ def _run_worker_session(
     ——詳見 `_worker.py` 檔案開頭的說明。"""
     import time
 
-    proc = subprocess.Popen(
+    payload_line = json.dumps(payload) + "\n"
+    timings: list[float] = []
+    worker_output: Optional[list[dict]] = None
+    stderr_lines: list[str] = []
+    with subprocess.Popen(
         [sys.executable, str(WORKER_SCRIPT)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -297,47 +338,46 @@ def _run_worker_session(
         encoding="utf-8",
         bufsize=1,
         cwd=str(TOOL_DIR),
-    )
-    payload_line = json.dumps(payload) + "\n"
-    timings: list[float] = []
-    worker_output: Optional[list[dict]] = None
-    try:
-        for _ in range(repeats):
-            start = time.perf_counter()
-            try:
-                assert proc.stdin is not None
-                proc.stdin.write(payload_line)
-                proc.stdin.flush()
-            except (BrokenPipeError, OSError):
-                break
-            assert proc.stdout is not None
-            line = _read_line_with_timeout(proc.stdout, timeout)
-            elapsed = time.perf_counter() - start
-            if not line:
-                break
-            timings.append(elapsed)
-            if worker_output is None:
+    ) as proc:
+        assert proc.stderr is not None
+        stderr_thread = threading.Thread(target=_drain_stderr, args=(proc.stderr, stderr_lines), daemon=True)
+        stderr_thread.start()
+        try:
+            for _ in range(repeats):
+                start = time.perf_counter()
                 try:
-                    worker_output = json.loads(line)
-                except json.JSONDecodeError:
-                    worker_output = None
+                    assert proc.stdin is not None
+                    proc.stdin.write(payload_line)
+                    proc.stdin.flush()
+                except (BrokenPipeError, OSError):
                     break
-    finally:
-        stderr_text = ""
-        try:
-            if proc.stdin is not None:
-                proc.stdin.close()
-        except (BrokenPipeError, OSError):
-            pass
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        if proc.stderr is not None:
-            stderr_text = proc.stderr.read()
+                assert proc.stdout is not None
+                line = _read_line_with_timeout(proc.stdout, timeout)
+                elapsed = time.perf_counter() - start
+                if not line:
+                    break
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    break
+                timings.append(elapsed)
+                if worker_output is None:
+                    worker_output = parsed
+        finally:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            stderr_thread.join(timeout=timeout)
 
     if len(timings) < repeats or worker_output is None:
+        stderr_text = "".join(stderr_lines)
         if stderr_text:
             print(stderr_text, file=sys.stderr)
         return None, timings
@@ -349,6 +389,19 @@ def _chunk_from_dict(d: dict) -> Chunk:
     d["page_index_range"] = tuple(d["page_index_range"])
     d["pdf_page_number_range"] = tuple(d["pdf_page_number_range"])
     return Chunk(**d)
+
+
+def _read_strategy_name() -> str:
+    """純文字讀取 `strategy.py` 的原始碼、用 regex 找 `STRATEGY_NAME = "..."`
+    這一行，完全不 import、不執行這個檔案裡的任何程式碼——見上方 import 區塊
+    的說明，這是為了避免 `strategy.py` 的模組層級程式碼在父行程裡跑，有機會
+    竄改父行程自己的 `time` 模組。找不到就回傳 `"unnamed"`，不當成錯誤。"""
+    try:
+        text = STRATEGY_SCRIPT.read_text(encoding="utf-8")
+    except OSError:
+        return "unnamed"
+    match = _STRATEGY_NAME_RE.search(text)
+    return match.group(1) if match else "unnamed"
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +482,7 @@ def run() -> None:
     print(f"seconds:           {median_seconds:.6f}")
     print(f"baseline_seconds:  {BASELINE_SECONDS:.6f}")
     print(f"num_chunks:        {len(all_chunks)}")
-    print(f"strategy_name:     {getattr(strategy, 'STRATEGY_NAME', 'unnamed')}")
+    print(f"strategy_name:     {_read_strategy_name()}")
     # 這裡只是 stdout 摘要的列印順序，Hermes 用 grep "^timestamp:" 這種方式逐欄位
     # 取值，不依賴印出的順序。results.tsv 實際的欄位順序是另一份獨立定義，見
     # program.md「記錄結果」章節（2026-08-14 起 timestamp 在 tsv 裡固定第一欄、
