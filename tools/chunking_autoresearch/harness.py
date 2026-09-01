@@ -21,15 +21,30 @@ Copilot）比較實驗中，Codex 把整份文件包成單一個 prose chunk（�
 道關卡沒有堵住的新漏洞：只檢查「內容有沒有保留」，沒檢查「有沒有真的做到
 有意義的切分」。加了 MAX_CHUNK_SHARE_OF_DOCUMENT 這道新關卡堵住這個做法。
 
+2026-09-01 補（`_worker.py` 改成常駐迴圈）：累積提升度卡在 14-15% 一段時間
+後，用 `python -X importtime` 實測發現原本「每次重複計時都整個重開一個新
+subprocess」的做法，重開直譯器＋重新 import 佔掉了 88.6% 的 `cost_time`，
+`strategy.chunk()` 自己的邏輯只佔 5.97%——真正的策略改進幅度幾乎完全被這筆
+重複繳的固定成本蓋過去。改成一個 subprocess 生命週期內處理 `TIMING_REPEATS`
+次請求（見 `_run_worker_session()`），import 成本只付一次；計時方式不變，
+仍然是父行程（這裡）用 `time.perf_counter()` 量每次來回的時間，子行程碰不到
+這個計時器，安全隔離性質沒有改變。**這個改動會讓量到的 `BASELINE_SECONDS`
+量級整個下降**（少了重複 import 的固定開銷），部署後第一次「設備基準測量」
+量到的 `device_baseline_cost_time` 會比部署前小很多——這是量測架構升級造成
+的，不是機器突然變快，program.md 已經有對應的 `REFERENCE_DEVICE_BASELINE`
+重新校準規則，不要把這次的落差當成「設備基準異常」處理。
+
 用法：python harness.py（或 uv run harness.py）
 """
 
 from __future__ import annotations
 
 import json
+import queue
 import statistics
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -229,36 +244,104 @@ def redundancy_ratio(chunks: list[Chunk]) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _run_worker_once(payload: list[dict]) -> tuple[Optional[list[dict]], float]:
-    """跑一次 _worker.py。回傳 (worker 輸出的文件/chunk 清單, 花費秒數)。
-    子行程 crash 或逾時，回傳 (None, 花費秒數)。
-    """
+def _read_line_with_timeout(stream, timeout: float) -> Optional[str]:
+    """從一個可能會卡住的 pipe 讀一行，最多等 `timeout` 秒。標準函式庫的
+    pipe 物件沒有內建的「讀一行、逾時就放棄」功能，且 `select`/`selectors`
+    在 Windows 上不支援一般的檔案／pipe（只支援 socket），所以用一個
+    daemon thread 去做真正的阻塞讀取，主執行緒用 `queue.get(timeout=...)`
+    等結果——這個寫法跨平台都能用，逾時沒讀到就回傳 None，讀取執行緒會在
+    stream 關閉或 process 被父行程強制結束後自然退出，不用手動中斷它。"""
+    result: "queue.Queue[str]" = queue.Queue(maxsize=1)
+
+    def _reader() -> None:
+        try:
+            line = stream.readline()
+        except (OSError, ValueError):
+            line = ""
+        result.put(line)
+
+    threading.Thread(target=_reader, daemon=True).start()
+    try:
+        return result.get(timeout=timeout)
+    except queue.Empty:
+        return None
+
+
+def _run_worker_session(
+    payload: list[dict], repeats: int, timeout: float
+) -> tuple[Optional[list[dict]], list[float]]:
+    """啟動「一個」常駐的 `_worker.py` subprocess，重複送 `repeats` 次同一份
+    payload，回傳 (第一次成功回覆的文件/chunk 清單, 每次來回各自量到的秒數
+    清單)。任何一次來回逾時、subprocess 提前結束、或回傳的不是合法 JSON，
+    直接視為這次 session 失敗，回傳 (None, 目前已經量到的秒數清單)——呼叫端
+    看 `len(timings) < repeats` 或 `worker_output is None` 就知道失敗了，
+    跟舊版「任何一次重複 crash 就整個當掉」的語意一致，不是新的行為。
+
+    2026-09-01 改成常駐 subprocess（原本是每次重複測時都整個重開一個新
+    subprocess）：實測發現直譯器重開＋重新 import `re`／`schema.py`（連帶
+    `dataclasses`／`inspect`／`typing`）佔掉了原本量到的 `cost_time` 的
+    88.6%，`strategy.chunk()` 本身只佔 5.97%，把策略真正的進步幅度整個蓋
+    過去。改成一個 subprocess 生命週期只付一次 import 成本，重複測時共用
+    已經 import 好的模組。**計時的人仍然是這裡（父行程）**：每一次來回都是
+    父行程自己用 `time.perf_counter()` 算「送出請求到收到回覆」的時間，
+    子行程只負責處理、完全不接觸這個計時器，跟改之前的安全隔離性質相同
+    ——詳見 `_worker.py` 檔案開頭的說明。"""
     import time
 
-    start = time.perf_counter()
+    proc = subprocess.Popen(
+        [sys.executable, str(WORKER_SCRIPT)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        bufsize=1,
+        cwd=str(TOOL_DIR),
+    )
+    payload_line = json.dumps(payload) + "\n"
+    timings: list[float] = []
+    worker_output: Optional[list[dict]] = None
     try:
-        result = subprocess.run(
-            [sys.executable, str(WORKER_SCRIPT)],
-            input=json.dumps(payload),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=SUBPROCESS_TIMEOUT_SECONDS,
-            cwd=str(TOOL_DIR),
-        )
-    except subprocess.TimeoutExpired:
-        return None, time.perf_counter() - start
-    elapsed = time.perf_counter() - start
+        for _ in range(repeats):
+            start = time.perf_counter()
+            try:
+                assert proc.stdin is not None
+                proc.stdin.write(payload_line)
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                break
+            assert proc.stdout is not None
+            line = _read_line_with_timeout(proc.stdout, timeout)
+            elapsed = time.perf_counter() - start
+            if not line:
+                break
+            timings.append(elapsed)
+            if worker_output is None:
+                try:
+                    worker_output = json.loads(line)
+                except json.JSONDecodeError:
+                    worker_output = None
+                    break
+    finally:
+        stderr_text = ""
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        if proc.stderr is not None:
+            stderr_text = proc.stderr.read()
 
-    if result.returncode != 0:
-        print(result.stderr, file=sys.stderr)
-        return None, elapsed
-    try:
-        return json.loads(result.stdout), elapsed
-    except json.JSONDecodeError:
-        print(result.stdout, file=sys.stderr)
-        print(result.stderr, file=sys.stderr)
-        return None, elapsed
+    if len(timings) < repeats or worker_output is None:
+        if stderr_text:
+            print(stderr_text, file=sys.stderr)
+        return None, timings
+    return worker_output, timings
 
 
 def _chunk_from_dict(d: dict) -> Chunk:
@@ -294,18 +377,10 @@ def run() -> None:
         for filename, pages in pages_by_doc.items()
     ]
 
-    timings: list[float] = []
-    worker_output: Optional[list[dict]] = None
-    for _ in range(TIMING_REPEATS):
-        result, elapsed = _run_worker_once(payload)
-        timings.append(elapsed)
-        if result is None:
-            print("strategy.chunk() 在 subprocess 裡失敗或逾時（詳見上方 stderr）", file=sys.stderr)
-            sys.exit(1)
-        if worker_output is None:
-            worker_output = result
-
-    assert worker_output is not None
+    worker_output, timings = _run_worker_session(payload, TIMING_REPEATS, SUBPROCESS_TIMEOUT_SECONDS)
+    if worker_output is None or len(timings) < TIMING_REPEATS:
+        print("strategy.chunk() 在 subprocess 裡失敗或逾時（詳見上方 stderr）", file=sys.stderr)
+        sys.exit(1)
     all_chunks: list[Chunk] = []
     coverage_scores: list[float] = []
     chunk_share_scores: list[float] = []

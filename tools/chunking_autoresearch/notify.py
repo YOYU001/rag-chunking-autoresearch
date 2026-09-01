@@ -69,7 +69,26 @@ def _rebaseline_lookup(all_rows: list[dict]) -> dict[str, dict]:
     return lookup
 
 
+# 見 program.md「開始每次執行前：設備基準測量」步驟 3、dashboard.py 同名常數的
+# 說明——harness.py 2026-09-01 改成 worker 常駐化後，量到的原始秒數大幅下降，
+# 不是機器變快或策略進步，拿新架構的數字直接跟舊架構時代的 REFERENCE_DEVICE_
+# BASELINE 比會冒出一個假的巨大提升度。
+_MEASUREMENT_ARCHITECTURE_MARKER = "量測架構升級"
+
+
 def _reference_device_baseline(all_rows: list[dict]) -> Optional[float]:
+    marker = next(
+        (
+            v
+            for r in all_rows
+            if r.get("status") == "rebaseline"
+            and _MEASUREMENT_ARCHITECTURE_MARKER in (r.get("description") or "")
+            and (v := _safe_float(r.get("device_baseline_cost_time"))) is not None
+        ),
+        None,
+    )
+    if marker is not None:
+        return marker
     return next(
         (v for r in all_rows if (v := _safe_float(r.get("device_baseline_cost_time"))) is not None),
         None,

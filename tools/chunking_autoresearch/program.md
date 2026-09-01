@@ -352,11 +352,40 @@ vs. 上一輪）的公平比較，沒解決**跨天、跨 session**的公平比�
    暫時複製過去跑（不要用會動到 commit 歷史的方式），**連續跑 3 次** `harness.py`，
    取 `cost_time` 的中位數，這就是這次 session 的 `device_baseline_cost_time`。
    跑完記得把 `strategy.py` 換回你目前分支上真正的版本。
-3. **找出 `REFERENCE_DEVICE_BASELINE`**：`results.tsv` 裡**史上第一筆有填
-   `device_baseline_cost_time` 的紀錄**，那個值就是 `REFERENCE_DEVICE_BASELINE`，
-   往後固定不變（除非人類手動決定要重新校準）。如果整份 `results.tsv` 裡完全找不到
-   任何一筆有填這個欄位（代表你是第一次執行這個新機制），那這次量到的
+3. **找出 `REFERENCE_DEVICE_BASELINE`**：**先檢查 `results.tsv` 裡有沒有任何一筆
+   `status=rebaseline` 且 `description` 含有「量測架構升級」這幾個字**——如果有，
+   取時間上最早的那一筆，它的 `device_baseline_cost_time` 才是目前有效的
+   `REFERENCE_DEVICE_BASELINE`，**比它更早的所有資料（不管是不是有填
+   `device_baseline_cost_time`）在找這個值時一律忽略**。如果完全找不到這種標記列，
+   才退回原本的規則：`results.tsv` 裡**史上第一筆有填 `device_baseline_cost_time`
+   的紀錄**就是 `REFERENCE_DEVICE_BASELINE`。往後固定不變（除非人類手動決定要重新
+   校準，或又發生一次下面說明的「量測架構升級」）。如果整份 `results.tsv` 裡完全
+   找不到任何一筆有填這個欄位（代表你是第一次執行這個新機制），那這次量到的
    `device_baseline_cost_time` 本身就是 `REFERENCE_DEVICE_BASELINE`。
+
+   **為什麼要有這條例外規則**：2026-09-01 `harness.py`／`_worker.py` 把「每次重複
+   計時都整個重開一個新 subprocess」改成「常駐一個 subprocess、重複請求共用同一份
+   已經 import 好的模組」——原因是實測發現重開直譯器＋重新 import 標準庫（`re`／
+   `dataclasses` 連帶 `inspect`／`typing`）佔掉了原本量到的 `cost_time` 的 88.6%，
+   `strategy.chunk()` 本身只佔 5.97%，把策略真正的進步幅度整個蓋過去，這也是累積
+   提升度長期卡在 14-15% 的主因。這個改動會讓所有「原始秒數」大幅下降，**這是量測
+   方法本身改變造成的，不是機器變快、也不是策略突然進步**——如果拿新架構量到的
+   `device_baseline_cost_time` 直接去跟舊架構時代的 `REFERENCE_DEVICE_BASELINE`
+   比，會被判定成一次巨大的「設備基準異常」（遠超過 15% 門檻），或更糟：如果沒有
+   異常告警機制攔住、被錯誤地拿來算「進步幅度」，會冒出一個跟策略改進完全無關的
+   假 20%——上面這條規則就是防止這件事發生。**部署新版 `harness.py` 後的第一次
+   執行**：除了正常做步驟 1-5，還要多寫一筆 `status=rebaseline` 的列，
+   `device_baseline_cost_time` 填這次測到的值，`description` 固定寫「量測架構
+   升級（worker 常駐化）後的第一次基準測量」。**`commit` 欄位這裡刻意不要填
+   原始 baseline commit（例如 `aac7907`）**，改填你當下分支的 HEAD commit——
+   因為 `commit` 是 `_rebaseline_lookup()` 拿來回填「舊 keep 列自己沒有
+   `device_baseline_cost_time`」的查詢鍵，如果跟既有 `aac7907` 那筆 8/14 時代
+   的 `rebaseline` 資料撞了同一個 `commit`，會讓查詢表裡新架構量到的極小數字
+   覆蓋舊架構時代正確的回填值，反而把最原始那筆 `baseline` 紀錄的顯示數字弄壞
+   （這裡要建立的是全新的 `REFERENCE_DEVICE_BASELINE`，跟「回填舊資料」是兩件
+   不相干的事，不要共用同一個 commit 當查詢鍵）——這筆就是未來所有人（包含你
+   自己）拿來判斷新 `REFERENCE_DEVICE_BASELINE` 的標記列，只需要在架構真的變動
+   的那一次寫，不是每次都要寫。
 4. **比對是否異常**：算 `abs(這次的 device_baseline_cost_time - REFERENCE_DEVICE_BASELINE) / REFERENCE_DEVICE_BASELINE`，
    如果超過 **15%**：
    - 用 `hermes send --to telegram "<訊息>"` 發一則通知，內容包含今天測到的數字、
