@@ -179,9 +179,34 @@ def _rebaseline_lookup(all_rows: list[dict]) -> dict[str, dict]:
     return lookup
 
 
+# 見 program.md「開始每次執行前：設備基準測量」步驟 3——harness.py 2026-09-01
+# 把 _worker.py 從「每次重複計時都重開一個新 subprocess」改成「常駐 subprocess、
+# 重複請求共用同一份已 import 好的模組」，這會讓量到的原始秒數大幅下降（少了
+# 重複 import 標準庫的固定成本），不是機器變快、也不是策略突然進步。拿新架構的
+# 數字直接跟舊架構時代的 REFERENCE_DEVICE_BASELINE 比，會冒出一個跟策略改進
+# 完全無關的巨大假百分比。Hermes 在架構升級後的第一次執行，會多寫一筆
+# status=rebaseline、description 含這個字串的標記列，當作新的參考基準。
+_MEASUREMENT_ARCHITECTURE_MARKER = "量測架構升級"
+
+
 def _reference_device_baseline(all_rows: list[dict]) -> Optional[float]:
     """史上第一筆有填 `device_baseline_cost_time` 的紀錄，當作往後所有「設備基準
-    正規化」計算的固定參考值。務必傳未篩選過的 rows 進來，理由同 `_first_value`。"""
+    正規化」計算的固定參考值。務必傳未篩選過的 rows 進來，理由同 `_first_value`。
+
+    先找有沒有「量測架構升級」標記列（見上方常數說明），有的話用它、忽略比它更早
+    的所有資料；沒有才退回原本「史上第一筆」的規則。"""
+    marker = next(
+        (
+            r["_device_baseline_cost_time"]
+            for r in all_rows
+            if r.get("status") == "rebaseline"
+            and _MEASUREMENT_ARCHITECTURE_MARKER in (r.get("description") or "")
+            and r.get("_device_baseline_cost_time") is not None
+        ),
+        None,
+    )
+    if marker is not None:
+        return marker
     return _first_value(all_rows, "_device_baseline_cost_time")
 
 

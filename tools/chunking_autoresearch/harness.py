@@ -21,27 +21,63 @@ Copilot）比較實驗中，Codex 把整份文件包成單一個 prose chunk（�
 道關卡沒有堵住的新漏洞：只檢查「內容有沒有保留」，沒檢查「有沒有真的做到
 有意義的切分」。加了 MAX_CHUNK_SHARE_OF_DOCUMENT 這道新關卡堵住這個做法。
 
+2026-09-01 補（`_worker.py` 改成常駐迴圈）：累積提升度卡在 14-15% 一段時間
+後，用 `python -X importtime` 實測發現原本「每次重複計時都整個重開一個新
+subprocess」的做法，重開直譯器＋重新 import 佔掉了 88.6% 的 `cost_time`，
+`strategy.chunk()` 自己的邏輯只佔 5.97%——真正的策略改進幅度幾乎完全被這筆
+重複繳的固定成本蓋過去。改成一個 subprocess 生命週期內處理 `TIMING_REPEATS`
+次請求（見 `_run_worker_session()`），import 成本只付一次；計時方式不變，
+仍然是父行程（這裡）用 `time.perf_counter()` 量每次來回的時間，子行程碰不到
+這個計時器。**這個改動會讓量到的 `BASELINE_SECONDS`
+量級整個下降**（少了重複 import 的固定開銷），部署後第一次「設備基準測量」
+量到的 `device_baseline_cost_time` 會比部署前小很多——這是量測架構升級造成
+的，不是機器突然變快，program.md 已經有對應的 `REFERENCE_DEVICE_BASELINE`
+重新校準規則，不要把這次的落差當成「設備基準異常」處理。
+
+**同一輪 QA 審查另外抓到一個更早就存在的舊漏洞（不是這次新引入，但既然這次
+重點就是重新確立「父行程計時、子行程碰不到」這個安全前提，一併修掉）**：
+`harness.py` 自己過去有 `import strategy`（只是為了讀 `STRATEGY_NAME` 印進
+摘要），但 import 本身就會執行 `strategy.py` 的模組層級程式碼——而這裡就是
+父行程自己的 process，`_run_worker_session()` 用的 `time` 模組是
+`sys.modules['time']` 這個全 process 共用的單例，只要 `strategy.py` 在模組
+層級動一行 monkeypatch，就能直接偽造父行程量到的 `cost_time`（QA 實測證實
+可行：偽造出 `cost_time: 0.000000` 還能通過 hard gate）。改成用純文字 regex
+從 `strategy.py` 原始碼擷取 `STRATEGY_NAME`（見 `_read_strategy_name()`），
+完全不 import、不執行這個檔案裡的任何程式碼，才是真正堵住「父行程碰不到」
+這句話唯一還沒堵住的破口。
+
 用法：python harness.py（或 uv run harness.py）
 """
 
 from __future__ import annotations
 
 import json
+import queue
+import re
 import statistics
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TextIO
 
 from pdf_utils import parse_pdf_pages
 from schema import Chunk, PageParseResult
 
-# 只用來讀 STRATEGY_NAME 這個字串常數放進摘要輸出，不會呼叫 strategy.chunk()
-# ——實際執行 chunk() 一律透過 _worker.py 的 subprocess，不在這個 process
-# 裡跑，所以這裡 import 不影響計時或評分的可信度。schema.py 拆出來之後，
-# strategy.py 已經不會再 import 這個檔案，不會有循環 import。
-import strategy
+# 2026-09-01 QA 審查抓到：這裡原本 `import strategy` 只是為了讀
+# `STRATEGY_NAME` 這個字串常數放進摘要輸出，註解宣稱「不會呼叫
+# strategy.chunk()，所以不影響計時或評分的可信度」——這個推論是錯的。
+# `import` 本身就會執行 `strategy.py` 的**模組層級程式碼**，而這個 process
+# 就是父行程本身，`_run_worker_session()` 拿到的 `time` 模組是
+# `sys.modules['time']` 這個全 process 共用的單例——只要 `strategy.py`
+# 在模組層級動一行 `sys.modules['time'].perf_counter = ...`，就能直接竄改
+# 父行程量到的計時，偽造出無限大的速度提升（已被 QA 實測證實可行，是
+# 這次 worker 常駐化改動之前就存在的舊漏洞，不是這次新引入的，但既然
+# 這次的重點就是重新確立「父行程計時、子行程碰不到」這個安全前提，
+# 這個洞必須一起補起來）。改成用純文字 regex 從 `strategy.py` 的原始碼
+# 擷取 `STRATEGY_NAME`，完全不 import、不執行這個檔案的任何程式碼。
+_STRATEGY_NAME_RE = re.compile(r'^STRATEGY_NAME\s*=\s*["\'](.+?)["\']\s*$', re.MULTILINE)
 
 # ---------------------------------------------------------------------------
 # 固定常數——agent 可以讀，但不能改這個檔案本身
@@ -115,6 +151,7 @@ TIMING_REPEATS = 3
 SUBPROCESS_TIMEOUT_SECONDS = 30
 
 WORKER_SCRIPT = TOOL_DIR / "_worker.py"
+STRATEGY_SCRIPT = TOOL_DIR / "strategy.py"
 
 
 # ---------------------------------------------------------------------------
@@ -229,36 +266,122 @@ def redundancy_ratio(chunks: list[Chunk]) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _run_worker_once(payload: list[dict]) -> tuple[Optional[list[dict]], float]:
-    """跑一次 _worker.py。回傳 (worker 輸出的文件/chunk 清單, 花費秒數)。
-    子行程 crash 或逾時，回傳 (None, 花費秒數)。
-    """
+def _read_line_with_timeout(stream: TextIO, timeout: float) -> Optional[str]:
+    """從一個可能會卡住的 pipe 讀一行，最多等 `timeout` 秒。標準函式庫的
+    pipe 物件沒有內建的「讀一行、逾時就放棄」功能，且 `select`/`selectors`
+    在 Windows 上不支援一般的檔案／pipe（只支援 socket），所以用一個
+    daemon thread 去做真正的阻塞讀取，主執行緒用 `queue.get(timeout=...)`
+    等結果——這個寫法跨平台都能用，逾時沒讀到就回傳 None，讀取執行緒會在
+    stream 關閉或 process 被父行程強制結束後自然退出，不用手動中斷它。"""
+    result: "queue.Queue[str]" = queue.Queue(maxsize=1)
+
+    def _reader() -> None:
+        try:
+            line = stream.readline()
+        except (OSError, ValueError):
+            line = ""
+        result.put(line)
+
+    threading.Thread(target=_reader, daemon=True).start()
+    try:
+        return result.get(timeout=timeout)
+    except queue.Empty:
+        return None
+
+
+def _drain_stderr(stream: TextIO, out: list[str]) -> None:
+    """持續、非阻塞地把子行程的 stderr 讀進 `out`，在背景 thread 執行，跟主
+    迴圈平行跑（不是等全部重複測完才一次讀）。OS 的 pipe buffer 有限（常見
+    預設約 64KB）：如果只在最後才讀 stderr，子行程一旦寫了夠多內容（不只是
+    crash 的 traceback，一般的 debug print 也算）就會卡在寫入上，連帶讓對應
+    那次 stdout 讀取逾時、把整個 session 誤判成失敗——用一個持續在背景吸收
+    輸出的 thread 才能避免 pipe 被塞滿卡住。"""
+    for line in iter(stream.readline, ""):
+        out.append(line)
+
+
+def _run_worker_session(
+    payload: list[dict], repeats: int, timeout: float
+) -> tuple[Optional[list[dict]], list[float]]:
+    """啟動「一個」常駐的 `_worker.py` subprocess，重複送 `repeats` 次同一份
+    payload，回傳 (第一次成功回覆的文件/chunk 清單, 每次來回各自量到的秒數
+    清單)。任何一次來回逾時、subprocess 提前結束、或回傳的不是合法 JSON，
+    直接視為這次 session 失敗，回傳 (None, 目前已經量到的秒數清單)——呼叫端
+    看 `len(timings) < repeats` 或 `worker_output is None` 就知道失敗了，
+    跟舊版「任何一次重複 crash 就整個當掉」的語意一致，不是新的行為。**每一次
+    來回收到的回覆都會各自驗證是合法 JSON**（不是只驗證第一次），確保「重複
+    `repeats` 次的每一次都真的是有效回應」這個不變量沒有被弱化——萬一某次
+    重複因為模組層級狀態污染等原因回傳壞掉的內容，那次連同它的計時會被整個
+    session 判定失敗，不會被安靜地算進中位數。
+
+    2026-09-01 改成常駐 subprocess（原本是每次重複測時都整個重開一個新
+    subprocess）：實測發現直譯器重開＋重新 import `re`／`schema.py`（連帶
+    `dataclasses`／`inspect`／`typing`）佔掉了原本量到的 `cost_time` 的
+    88.6%，`strategy.chunk()` 本身只佔 5.97%，把策略真正的進步幅度整個蓋
+    過去。改成一個 subprocess 生命週期只付一次 import 成本，重複測時共用
+    已經 import 好的模組。**計時的人仍然是這裡（父行程）**：每一次來回都是
+    父行程自己用 `time.perf_counter()` 算「送出請求到收到回覆」的時間，
+    子行程只負責處理、完全不接觸這個計時器，跟改之前的安全隔離性質相同
+    ——詳見 `_worker.py` 檔案開頭的說明。"""
     import time
 
-    start = time.perf_counter()
-    try:
-        result = subprocess.run(
-            [sys.executable, str(WORKER_SCRIPT)],
-            input=json.dumps(payload),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=SUBPROCESS_TIMEOUT_SECONDS,
-            cwd=str(TOOL_DIR),
-        )
-    except subprocess.TimeoutExpired:
-        return None, time.perf_counter() - start
-    elapsed = time.perf_counter() - start
+    payload_line = json.dumps(payload) + "\n"
+    timings: list[float] = []
+    worker_output: Optional[list[dict]] = None
+    stderr_lines: list[str] = []
+    with subprocess.Popen(
+        [sys.executable, str(WORKER_SCRIPT)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        bufsize=1,
+        cwd=str(TOOL_DIR),
+    ) as proc:
+        assert proc.stderr is not None
+        stderr_thread = threading.Thread(target=_drain_stderr, args=(proc.stderr, stderr_lines), daemon=True)
+        stderr_thread.start()
+        try:
+            for _ in range(repeats):
+                start = time.perf_counter()
+                try:
+                    assert proc.stdin is not None
+                    proc.stdin.write(payload_line)
+                    proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    break
+                assert proc.stdout is not None
+                line = _read_line_with_timeout(proc.stdout, timeout)
+                elapsed = time.perf_counter() - start
+                if not line:
+                    break
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    break
+                timings.append(elapsed)
+                if worker_output is None:
+                    worker_output = parsed
+        finally:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            stderr_thread.join(timeout=timeout)
 
-    if result.returncode != 0:
-        print(result.stderr, file=sys.stderr)
-        return None, elapsed
-    try:
-        return json.loads(result.stdout), elapsed
-    except json.JSONDecodeError:
-        print(result.stdout, file=sys.stderr)
-        print(result.stderr, file=sys.stderr)
-        return None, elapsed
+    if len(timings) < repeats or worker_output is None:
+        stderr_text = "".join(stderr_lines)
+        if stderr_text:
+            print(stderr_text, file=sys.stderr)
+        return None, timings
+    return worker_output, timings
 
 
 def _chunk_from_dict(d: dict) -> Chunk:
@@ -266,6 +389,19 @@ def _chunk_from_dict(d: dict) -> Chunk:
     d["page_index_range"] = tuple(d["page_index_range"])
     d["pdf_page_number_range"] = tuple(d["pdf_page_number_range"])
     return Chunk(**d)
+
+
+def _read_strategy_name() -> str:
+    """純文字讀取 `strategy.py` 的原始碼、用 regex 找 `STRATEGY_NAME = "..."`
+    這一行，完全不 import、不執行這個檔案裡的任何程式碼——見上方 import 區塊
+    的說明，這是為了避免 `strategy.py` 的模組層級程式碼在父行程裡跑，有機會
+    竄改父行程自己的 `time` 模組。找不到就回傳 `"unnamed"`，不當成錯誤。"""
+    try:
+        text = STRATEGY_SCRIPT.read_text(encoding="utf-8")
+    except OSError:
+        return "unnamed"
+    match = _STRATEGY_NAME_RE.search(text)
+    return match.group(1) if match else "unnamed"
 
 
 # ---------------------------------------------------------------------------
@@ -294,18 +430,10 @@ def run() -> None:
         for filename, pages in pages_by_doc.items()
     ]
 
-    timings: list[float] = []
-    worker_output: Optional[list[dict]] = None
-    for _ in range(TIMING_REPEATS):
-        result, elapsed = _run_worker_once(payload)
-        timings.append(elapsed)
-        if result is None:
-            print("strategy.chunk() 在 subprocess 裡失敗或逾時（詳見上方 stderr）", file=sys.stderr)
-            sys.exit(1)
-        if worker_output is None:
-            worker_output = result
-
-    assert worker_output is not None
+    worker_output, timings = _run_worker_session(payload, TIMING_REPEATS, SUBPROCESS_TIMEOUT_SECONDS)
+    if worker_output is None or len(timings) < TIMING_REPEATS:
+        print("strategy.chunk() 在 subprocess 裡失敗或逾時（詳見上方 stderr）", file=sys.stderr)
+        sys.exit(1)
     all_chunks: list[Chunk] = []
     coverage_scores: list[float] = []
     chunk_share_scores: list[float] = []
@@ -354,7 +482,7 @@ def run() -> None:
     print(f"seconds:           {median_seconds:.6f}")
     print(f"baseline_seconds:  {BASELINE_SECONDS:.6f}")
     print(f"num_chunks:        {len(all_chunks)}")
-    print(f"strategy_name:     {getattr(strategy, 'STRATEGY_NAME', 'unnamed')}")
+    print(f"strategy_name:     {_read_strategy_name()}")
     # 這裡只是 stdout 摘要的列印順序，Hermes 用 grep "^timestamp:" 這種方式逐欄位
     # 取值，不依賴印出的順序。results.tsv 實際的欄位順序是另一份獨立定義，見
     # program.md「記錄結果」章節（2026-08-14 起 timestamp 在 tsv 裡固定第一欄、

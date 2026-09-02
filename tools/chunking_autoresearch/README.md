@@ -20,7 +20,13 @@ custom subagent 加上 `codex` 一起做了一次獨立審查，抓到「品質�
   **agent 不能編輯**。
 - **`_worker.py`** — 固定：在獨立 subprocess 裡執行 `strategy.chunk()`，
   讓 agent 的程式碼碰不到 `harness.py` 自己的計時器跟常數，也讓
-  `harness.py` 可以對它強制設 timeout。不需要手動執行。
+  `harness.py` 可以對它強制設 timeout。不需要手動執行。**2026-09-01 起
+  改成常駐迴圈**：一個 subprocess 生命週期內處理 `TIMING_REPEATS` 次請求
+  （原本是每次重複計時都整個重開一個新 subprocess），import 標準庫的固定
+  成本只付一次；計時方式沒變，還是父行程 `harness.py` 在外面掐錶算每次
+  來回的時間，子行程碰不到那個計時器，安全隔離性質不變。這是因為實測發現
+  舊版「重開 subprocess」的固定成本佔了量到的 `cost_time` 的 88.6%，
+  `strategy.chunk()` 本身只佔 5.97%，見下方「記分方式」的說明。
 - **`strategy.py`** — agent 唯一能編輯的檔案。目前內容是從 MVP_V1
   `spike/chunker.py` 的 `structured_600_100` 策略簡化移植過來的 baseline。
 - **`program.md`** — 餵給 Hermes 的操作說明／agent skill，包含完整的
@@ -64,6 +70,17 @@ custom subagent 加上 `codex` 一起做了一次獨立審查，抓到「品質�
 干擾。如果這次量到的設備基準跟參考值差超過 15%，會被視為異常，Hermes 會發
 Telegram 通知並在 `results.tsv` 跟 dashboard 上標註，細節見 `program.md`
 「開始每次執行前：設備基準測量」一節。
+
+**量測架構升級（2026-09-01）**：累積提升度長期卡在 14-15%，用
+`python -X importtime` 實測發現舊版「每次重複計時都重開一個新 subprocess」
+的做法，重開直譯器＋重新 import 標準庫（`re`／`dataclasses` 連帶
+`inspect`／`typing`）佔掉了 88.6% 的 `cost_time`，`strategy.chunk()` 本身
+只佔 5.97%——真正的策略改進幅度幾乎完全被這筆固定的「開機稅」蓋過去，
+20% 的目標在舊架構下可能本來就摸不到。`_worker.py` 改成常駐迴圈後
+（見上方檔案說明），這筆固定成本大幅下降；因為這是量測方法本身改變、
+不是機器變快或策略進步，`REFERENCE_DEVICE_BASELINE` 有對應的重新校準
+規則（一筆 `description` 含「量測架構升級」字樣的 `rebaseline` 標記列，
+細節見 `program.md`），避免新舊架構的數字被誤比較成一個假的進步幅度。
 
 ## 快速開始
 
