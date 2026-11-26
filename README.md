@@ -64,7 +64,11 @@ The first version had only format checks. An independent review found that a str
 
 ## Results
 
-The agent ran nightly on a NAS for about a month (August to early September 2026) with Telegram progress alerts. The loop is paused: the cumulative speedup plateaued at 14-15%, short of the 20% target, because the logic `strategy.py` can change is a small part of total processing time.
+The agent ran nightly on a NAS on 22 days between Aug 10 and Sep 1, 2026, with Telegram progress alerts: **110 experiments, 25 kept and 85 discarded**, reaching a best speedup of **15.1%** over the baseline with every quality gate passing. The loop is paused: the speedup plateaued at 14-15%, short of the 20% target, because the logic `strategy.py` can change is a small part of total processing time.
+
+![AutoResearch progress](docs/assets/autoresearch_progress.png)
+
+Raw log of every run: [results/chunking_autoresearch_results.tsv](results/chunking_autoresearch_results.tsv) (the `description` column is the agent's original note, in Traditional Chinese).
 
 Best changes found, all verified output-identical to the previous version:
 
@@ -114,7 +118,7 @@ To run the agent loop, point a Hermes session at this repository and follow `too
 tools/chunking_autoresearch/   harness, strategy, worker, dashboard, notifier, MCP server
 docs/                          findings report, chunking-metrics research, test documents
 datasets/                      retrieval test questions and baselines from the energy copilot
-results/                       experiment outputs
+results/                       full experiment log (results.tsv)
 .claude/                       agents, rules and skills used during development
 ```
 

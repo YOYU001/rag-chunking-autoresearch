@@ -24,6 +24,7 @@
   skills/                                       # 自訂 skill，格式為 <name>/SKILL.md + scripts/（periodic-housekeeping、api-cost-estimate）
   rules/                                        # 路徑限定規則（paths frontmatter），例如 python.md、sql.md
 docs/
+  assets/                                             # README 圖表
   chunking_autoresearch_findings_for_mvp1_2026-09-02.md  # 暫停前的實驗成果報告
   rag_chunking_evaluation_metrics_research.md         # chunking／RAG 評測指標研究
   spike_documents/                                    # harness 使用的 4 份測試 PDF
@@ -32,7 +33,7 @@ datasets/
   energyops_test_questions.json              # 29 題固定評測問題，複製自 MVP_V1 spike/test_questions.json
   energyops_retrieval_benchmark_baseline.json # MVP_V1 的 retrieval baseline 數字，作為 Baseline 參考
   energyops_chunking_comparison_baseline.json # Phase 5/6 之前用不到
-results/                                      # 每次評測跑出來的結果放這裡（目前是空的）
+results/                                      # 實驗結果；chunking_autoresearch_results.tsv 是 NAS 上 results.tsv 的完整副本
 active/                                        # 工作中的暫存區，不進版控（見下方說明）
   research/                                    # 探索性研究、筆記草稿
   execution/                                   # 執行中、尚未定案的評測中間產出
