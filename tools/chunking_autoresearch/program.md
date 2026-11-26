@@ -1,7 +1,7 @@
 # chunking-autoresearch
 
 這是讓 Hermes 自主實驗、找出更好的 RAG chunking 策略的專案。設計方式模仿
-`autoresearch`（Karpathy 的自動化訓練實驗專案）：
+Karpathy 的 autoresearch（自動化訓練實驗專案）：
 一個你可以自由修改的檔案、一個固定不可改的評分程式、一個單一的量化指標、
 一份實驗紀錄，然後無限迴圈跑下去。
 

@@ -1,7 +1,7 @@
 # chunking-autoresearch
 
 讓 Hermes 自主實驗、找出更好的 RAG chunking 策略，設計方式模仿
-`autoresearch`（Karpathy 的自動化訓練實驗專案）。
+Karpathy 的 autoresearch（自動化訓練實驗專案）。
 目標是優化姊妹專案「AI Energy Operations Copilot」（MVP_V1）的 chunking
 速度與結構品質，讓它更能適應持續變化的公司內部文件格式。
 

@@ -7,7 +7,7 @@ description: 在真正呼叫付費的 chat completion API（模型比較、LLM-a
 
 ## 這個 skill 在算什麼
 
-Phase 2 這類「AI Battle」評測，一次完整流程通常包含：**每題問過每個要比較的模型一次**（chat completion 呼叫），**加上每題一次 LLM-as-a-Judge 評分**（另一個模型看過題目跟所有候選答案後打分）。這支腳本把這整套流程要花的 token 跟美金，在真的打 API 之前先估算出來。
+模型比較評測，一次完整流程通常包含：**每題問過每個要比較的模型一次**（chat completion 呼叫），**加上每題一次 LLM-as-a-Judge 評分**（另一個模型看過題目跟所有候選答案後打分）。這支腳本把這整套流程要花的 token 跟美金，在真的打 API 之前先估算出來。
 
 ## 用法
 

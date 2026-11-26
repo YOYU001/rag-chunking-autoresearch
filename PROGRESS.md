@@ -15,10 +15,9 @@
 
 ## 2026-08-04
 
-- 建立 `CLAUDE.md`，說明專案定位（Evaluation 方法論專案，目前僅有 docs + datasets，尚無程式碼）、與 MVP_V1 的關係、資料夾結構與工作慣例。
+- 建立 `CLAUDE.md`，說明專案定位、、與 MVP_V1 的關係、資料夾結構與工作慣例。
 - 確立溝通與文件語言慣例：一律使用繁體中文，專有名詞除外。
 - 建立本 `PROGRESS.md`。
-- 下一步：把 Phase 1 詞彙表的「對應 MVP_V1 的實際例子」欄位填完，接著從 `datasets/energyops_test_questions.json` 挑 5–10 題進行 Phase 2 AI Battle，執行前需先用 `embed-cost-estimate` skill 估算成本。
 
 ## 2026-08-05
 
@@ -57,12 +56,13 @@
 - `.env` 內容使用者已自行填入，之後若需要除錯要用「是否存在／長度」的方式確認，不能直接讀取內容（持續性規則，不是待辦事項）。
 - 段落性里程碑檢查：問「環境建置好了、可以進 Phase 2 了嗎」，平行問了 `qa` agent + codex + copilot + agy 四方（呼應 `AGENTS.md` 的 Multi-LLM 討論流程，也是第一次實戰驗證這個流程）。過程中順手解決了 `agy` 非互動模式讀不到檔案的問題：它有自己獨立的 `C:\Users\User\.gemini\antigravity-cli\settings.json`，需要加 `permissions.allow: ["command(*)"]` 才能執行指令，且要用 `--add-dir <路徑>` 明確指定要讀的專案（它不會跟著 shell 的 `cd` 走，有自己獨立的「目前專案」概念）。四方一致結論：可以進 Phase 2。codex + agy 各自獨立提出「目前 tooling 相對於實際工作量偏重」的批評；copilot + agy 各自獨立發現 `embed-cost-estimate` skill 只存在於 MVP_V1、這個 repo 沒有；codex 額外抓到 `.gitignore` 允許 `.env.example` 但會被 `Read(.env.*)` 擋住的規則衝突（`.env.example` 目前還不存在，暫時無害）。
 - `AGENTS.md` 補上明確的階層宣告：Claude 是主要操作、思考、統整的領導者，codex/copilot/antigravity 是合作者、提供獨立意見，不是共同決策者，分歧時由 Claude 判斷取捨並對使用者負責。
+- 新增 `.claude/skills/api-cost-estimate/`（`SKILL.md` + `scripts/estimate_cost.py`），取代原本規劃借用的 MVP_V1 `embed-cost-estimate`。刻意設計成**不綁定任何特定專案或資料集**：題目來源可以是任意檔案（純文字一行一題，或 JSON 陣列／物件），也可以純手動指定數量與長度；同時考慮呼叫次數（`--reruns`）與 reasoning/thinking 深度（`--model`／`--judge` 可帶 `low`/`medium`/`high`/`xhigh` 效果等級，套用粗略的 output token 放大倍數）。用真實的 `energyops_test_questions.json` 題目文字實測過，也測過純手動輸入模式跟錯誤處理。`CLAUDE.md` 裡舊的 `embed-cost-estimate` 引用已同步更正。
 - 修正 CLAUDE.md 的 `/context 的版面` 小技巧補充說明並 commit（`a832f6d`）。
 
 ## 2026-08-06
 
 - **裝好 hermes-agent（獨立於本專案之外）**：完整安裝在 `hermes-agent`（clone + uv venv + Python/npm 依賴），Nous Portal 登入完成，大腦模型換成 Claude Sonnet 5，VS Code／Cursor 都裝了 ACP Client 擴充套件並成功連線。過程中排查並修正一個環境問題：手動安裝（非官方安裝程式）少了 `HERMES_GIT_BASH_PATH` 環境變數，加上 Git 裝在非標準路徑（`C:\my_AI\Git`），導致 Hermes 的 terminal 工具誤判走到系統裡一個沒作用的 WSL 樁——修法是把 `HERMES_GIT_BASH_PATH` 直接寫進 VS Code／Cursor 的 `acp.agents` 設定的 `env` 欄位（不只依賴系統環境變數，避免 ACP Client 擴充套件的 child_process 沒繼承到）。這部分是使用者個人工具鏈的一部分，不進這個 repo 的版控。
-- **新增 `tools/chunking_autoresearch/`**：讓 Hermes 之後可以對姊妹專案 MVP_V1 的 RAG chunking 策略做自動化實驗（速度＋結構品質），設計上完整模仿 `autoresearch`（Karpathy 的自動化訓練實驗專案）的模式——`harness.py`（固定、agent 不可改的驗證程式，量化指標 `cost` 越低越好）、`strategy.py`（agent 唯一能自由改寫的檔案，目前是 MVP_V1 `structured_600_100` 簡化移植的 baseline）、`program.md`（Hermes 的完整操作說明，含「無限迴圈、不要停」的自主實驗規則）、`mcp_server.py`（暴露 `list_chunking_experiments`／`get_best_chunking_strategy`／`get_chunking_experiment_summary` 三個工具給 Claude Code 查詢實驗結果）。同時複製 MVP_V1 的 4 份 spike PDF 到 `docs/spike_documents/`（符合本 repo 一次性複製、不跟 MVP_V1 同步的慣例），並建立本專案第一份 `requirements.txt`（`pymupdf==1.28.0`、`mcp==1.28.1`）與對應的 `.venv/`。
+- **新增 `tools/chunking_autoresearch/`**：讓 Hermes 之後可以對姊妹專案 MVP_V1 的 RAG chunking 策略做自動化實驗（速度＋結構品質），設計上完整模仿 Karpathy 的 autoresearch（自動化訓練實驗專案）的模式——`harness.py`（固定、agent 不可改的驗證程式，量化指標 `cost` 越低越好）、`strategy.py`（agent 唯一能自由改寫的檔案，目前是 MVP_V1 `structured_600_100` 簡化移植的 baseline）、`program.md`（Hermes 的完整操作說明，含「無限迴圈、不要停」的自主實驗規則）、`mcp_server.py`（暴露 `list_chunking_experiments`／`get_best_chunking_strategy`／`get_chunking_experiment_summary` 三個工具給 Claude Code 查詢實驗結果）。同時複製 MVP_V1 的 4 份 spike PDF 到 `docs/spike_documents/`（符合本 repo 一次性複製、不跟 MVP_V1 同步的慣例），並建立本專案第一份 `requirements.txt`（`pymupdf==1.28.0`、`mcp==1.28.1`）與對應的 `.venv/`。
   - 明確分兩階段：**第一階段（已建好、可以跑）**完全本機、零成本，只測 chunking 速度與結構品質；**第二階段（刻意不自動化）**要手動用 `api-cost-estimate` 抓成本上限，才能接上 MVP_V1 真的 OpenAI Embedding API 驗證搜尋準確度，不讓 Hermes 自動、無限制地花錢。
   - 已驗證：`harness.py` baseline 可以完整跑完（257 個 chunk，量級跟 MVP_V1 原版 366 個吻合，差異來自刻意簡化掉的第二種表格偵測路徑）；手動改 `strategy.py` 的 `CHUNK_SIZE` 後 `cost`／`num_chunks` 確實跟著變化，迴圈機制沒問題；`mcp_server.py` 的三個工具在空檔案與有資料兩種情況都測過，讀取正確；已用 `claude mcp add chunking-research` 註冊進這個專案的 Claude Code 設定。
   - 下一步：讓 Hermes 實際照 `program.md` 走一次完整的 setup + 實驗迴圈（目前只有 Claude Code 手動驗證過機制沒問題，還沒讓 Hermes 自己跑過）；新的 MCP server 要等 Claude Code 重啟一次 session 才會出現在可用工具清單裡。

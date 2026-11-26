@@ -1340,7 +1340,7 @@ document.addEventListener('DOMContentLoaded', function() {{
           <div class="panel">
             <div class="section-title">本次執行資源</div>
             <div class="footnote" style="font-size:0.85rem;color:var(--text)">最新一筆耗時：{latest_seconds_str}</div>
-            <div class="footnote" style="font-size:0.85rem;color:var(--text)">花費：$0.00（Phase 1 完全本機執行，零 API 成本）</div>
+            <div class="footnote" style="font-size:0.85rem;color:var(--text)">花費：$0.00（完全本機執行，零 API 成本）</div>
           </div>
         </div>
       </div>
